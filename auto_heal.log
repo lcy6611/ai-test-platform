@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "E:\PycharmProjects\0513\auto_heal.py", line 16, in test_login_form_fields
+    assert False, "模拟断言失败"  # 测试用，实际可删除
+AssertionError: 模拟断言失败
+assert False

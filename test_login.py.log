@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "E:\PycharmProjects\0513\test_login.py", line 23, in test_login
+    assert "dashboard" in page.url  # 假设登录后跳转到dashboard
+AssertionError: assert 'dashboard' in 'http://10.0.62.222:30050/user/login?redirect=%252Fhome'
+ +  where 'http://10.0.62.222:30050/user/login?redirect=%252Fhome' = <Page url='http://10.0.62.222:30050/user/login?redirect=%252Fhome'>.url
