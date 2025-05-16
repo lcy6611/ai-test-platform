@@ -11,11 +11,9 @@ pipeline {
         }
         stage('Install Dependencies') {
             steps {
-<<<<<<< HEAD
-                bat 'pip install --requirement requirements.txt --encoding=utf-8'
-=======
 
->>>>>>> adc216ec4f1c8dfd27fdbb4053a5b3086f0261d3
+                bat 'pip install requirements.txt'
+
                 bat 'playwright install'
                 bat 'pip install allure-pytest'
             }
