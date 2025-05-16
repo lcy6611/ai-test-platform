@@ -13,8 +13,8 @@ DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 
 def generate_playwright_script(test_case):
     """
-    调用deepseek-chat API，将测试用例转为Playwright+Python自动化脚本
-    要求所有注释都用三引号""""""风格，且测试函数不带任何参数，统一用with sync_playwright() as p:方式启动Playwright。
+    调用deepseek-chat API，将测试用例转为Playwright+Python自动化脚本。
+    要求所有注释都用三引号风格，且测试函数不带任何参数，统一用with sync_playwright() as p:方式启动Playwright。
     """
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
@@ -23,7 +23,7 @@ def generate_playwright_script(test_case):
     prompt = (
         "请将以下测试用例转化为Playwright+Python自动化测试脚本，"
         "要求可直接运行，包含必要的import和断言，"
-        "所有中文注释都用三引号\"\"\"注释内容\"\"\"风格，不要用#，"
+        "所有中文注释都用三引号风格，不要用#，"
         "测试函数不要带任何参数，统一用with sync_playwright() as p:方式启动Playwright。"
         "不要生成 assert False 这种占位断言，遇到无法实现的断言请用 pass 占位。"
         "脚本整体风格规范。"
@@ -38,14 +38,17 @@ def generate_playwright_script(test_case):
 
 def clean_code_block(text):
     """
-    去除AI返回的 markdown 代码块标记
+    去除AI返回的 markdown 代码块标记，包括```python和```等
     """
     text = text.strip()
-    # 去除三重反引号包裹
-    if text.startswith("```"):
-        text = text.split('\n', 1)[-1]
-        if text.endswith("```"):
-            text = text.rsplit('\n', 1)[0]
+    # 去除 ```python 或 ``` 开头
+    if text.startswith("```python"):
+        text = text[9:]
+    elif text.startswith("```"):
+        text = text[3:]
+    # 去除结尾 ```
+    if text.strip().endswith("```"):
+        text = text.strip()[:-3]
     return text.strip()
 
 def remove_invalid_asserts(script: str) -> str:
@@ -56,14 +59,14 @@ def remove_invalid_asserts(script: str) -> str:
     return script
 
 if __name__ == "__main__":
+    # 清理历史无效脚本，避免pytest收集到旧文件
+    for fname in os.listdir('.'):
+        if fname.startswith("playwright_test_") and fname.endswith(".py"):
+            os.remove(fname)
     with open("testcases.json", "r", encoding="utf-8") as f:
         test_cases = json.load(f)
     for idx, case in enumerate(test_cases):
         script_filename = f"playwright_test_{idx+1}.py"
-        # 如果脚本已存在，则跳过生成
-        if os.path.exists(script_filename):
-            print(f"{script_filename} 已存在，跳过生成。")
-            continue
         script = generate_playwright_script(json.dumps(case, ensure_ascii=False))
         script = clean_code_block(script)
         script = remove_invalid_asserts(script)
