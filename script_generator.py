@@ -26,6 +26,8 @@ def generate_playwright_script(test_case):
         "所有中文注释都用三引号风格，不要用#，"
         "测试函数不要带任何参数，统一用with sync_playwright() as p:方式启动Playwright。"
         "不要生成 assert False 这种占位断言，遇到无法实现的断言请用 pass 占位。"
+        "不要用本地文件路径如login_form.html或file:///path/to/login_form.html，"
+        "请统一用实际可访问的URL（如 http://10.0.62.222:30050/ ），"
         "脚本整体风格规范。"
         f"\n{test_case}"
     )
@@ -58,6 +60,15 @@ def remove_invalid_asserts(script: str) -> str:
     script = re.sub(r'^\s*assert\s+False.*$', '', script, flags=re.MULTILINE)
     return script
 
+def ensure_imports(script: str) -> str:
+    """
+    确保脚本包含必要的 import 语句
+    """
+    imports = "from playwright.sync_api import sync_playwright\nimport time\n"
+    if "from playwright.sync_api import sync_playwright" not in script:
+        script = imports + script
+    return script
+
 if __name__ == "__main__":
     # 清理历史无效脚本，避免pytest收集到旧文件
     for fname in os.listdir('.'):
@@ -70,6 +81,7 @@ if __name__ == "__main__":
         script = generate_playwright_script(json.dumps(case, ensure_ascii=False))
         script = clean_code_block(script)
         script = remove_invalid_asserts(script)
+        script = ensure_imports(script)
         with open(script_filename, "w", encoding="utf-8") as f:
             f.write(script)
         print(f"已生成脚本: {script_filename}")
