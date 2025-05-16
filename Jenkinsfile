@@ -12,7 +12,7 @@ pipeline {
         stage('Install Dependencies') {
             steps {
 
-                bat 'pip install requirements.txt'
+                bat 'pip install -r requirements.txt'
 
                 bat 'playwright install'
                 bat 'pip install allure-pytest'
