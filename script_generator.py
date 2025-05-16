@@ -36,6 +36,18 @@ def generate_playwright_script(test_case):
     response = requests.post(DEEPSEEK_API_URL, headers=headers, json=data)
     return response.json()["choices"][0]["message"]["content"]
 
+def clean_code_block(text):
+    """
+    去除AI返回的 markdown 代码块标记
+    """
+    text = text.strip()
+    # 去除三重反引号包裹
+    if text.startswith("```"):
+        text = text.split('\n', 1)[-1]
+        if text.endswith("```"):
+            text = text.rsplit('\n', 1)[0]
+    return text.strip()
+
 def remove_invalid_asserts(script: str) -> str:
     """
     自动去除AI生成脚本中的 assert False 相关无效断言
@@ -53,6 +65,7 @@ if __name__ == "__main__":
             print(f"{script_filename} 已存在，跳过生成。")
             continue
         script = generate_playwright_script(json.dumps(case, ensure_ascii=False))
+        script = clean_code_block(script)
         script = remove_invalid_asserts(script)
         with open(script_filename, "w", encoding="utf-8") as f:
             f.write(script)
