@@ -11,40 +11,39 @@ pipeline {
         }
         stage('Install Dependencies') {
             steps {
-                sh 'pip install -r requirements.txt'
-                sh 'playwright install'
+                bat 'pip install -r requirements.txt'
+                bat 'playwright install'
+                bat 'pip install allure-pytest'
             }
         }
-        stage('Extract Requirements') {
+        stage('Page Snapshot') {
             steps {
-                sh 'python requirement_extractor.py'
+                bat 'python page_snapshot_collector.py'
             }
         }
         stage('Generate Test Cases') {
             steps {
-                sh 'python testcase_generator.py'
+                bat 'python testcases_generator_by_snapshot.py'
             }
         }
-        stage('Generate Test Scripts') {
+        stage('Generate Scripts') {
             steps {
-                sh 'python script_generator.py'
+                bat 'python script_generator.py'
             }
         }
-        stage('Run Playwright Tests') {
+        stage('Run Tests') {
             steps {
-                sh 'python run_tests.py'
+                bat 'python run_tests.py'
             }
         }
-        stage('Self-Heal (Auto-Heal)') {
+        stage('Auto Heal') {
             steps {
-                // 假设只对第一个脚本自愈，可根据实际情况循环所有脚本
-                sh 'python auto_heal.py'
+                bat 'python auto_heal.py'
             }
         }
         stage('Re-Run Healed Tests') {
             steps {
-                // 运行自愈后的脚本（如playwright_test_1.py.healed）
-                sh 'pytest playwright_test_1.py.healed --alluredir=allure-results || true'
+                bat 'pytest playwright_test_*.py.healed --alluredir=allure-results || exit 0'
             }
         }
         stage('Allure Report') {
