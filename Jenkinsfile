@@ -2,7 +2,7 @@ pipeline {
     agent any
     environment {
         PYTHONUNBUFFERED = 1
-        DEEPSEEK_API_KEY = credentials('DEEPSEEK_API_KEY') // 这里的ID和凭据ID一致
+        DEEPSEEK_API_KEY = credentials('DEEPSEEK_API_KEY') // Jenkins凭据ID需一致
     }
     stages {
         stage('Checkout') {
@@ -47,11 +47,12 @@ pipeline {
                 bat 'pytest playwright_test_*.py.healed --alluredir=allure-results || exit 0'
             }
         }
-        stage('Allure Report') {
-            steps {
-                allure includeProperties: false, jdk: '', results: [[path: 'allure-results']]
-            }
-        }
+        // 如未安装Allure插件，先注释掉此步骤
+        // stage('Allure Report') {
+        //     steps {
+        //         allure includeProperties: false, jdk: '', results: [[path: 'allure-results']]
+        //     }
+        // }
     }
     post {
         always {
