@@ -53,24 +53,29 @@ pipeline {
                 // 'allure' 命令可能需要配置到系统 PATH 或在 Jenkins 的全局工具配置中设置
                 // 如果 'allure' 命令找不到，请检查您的 Jenkins 系统配置
                 bat 'allure generate --clean allure-results'
-                // 您可能需要一个 post 阶段来发布 Allure 报告，这里只是生成
-                // 例如: allure([includeProperties: false, reportBuildFailure: true, reportDir: 'allure-report'])
             }
         }
     }
 
     post {
         always {
-            // 总是执行的清理或其他操作
-            // 可以添加 Allure 报告发布的 post 阶段在这里
-            // 例如:
-            // allure([includeProperties: false, reportBuildFailure: true, reportDir: 'allure-report'])
+            steps {
+                // 总是执行的清理或其他操作
+                // 可以添加 Allure 报告发布的 post 阶段在这里
+                // 例如:
+                // allure([includeProperties: false, reportBuildFailure: true, reportDir: 'allure-report'])
+                 echo 'Pipeline always block executed.' // 示例步骤
+            }
         }
         success {
-            echo 'Pipeline succeeded!'
+            steps {
+                echo 'Pipeline succeeded!'
+            }
         }
         failure {
-            echo 'Pipeline failed!'
+            steps {
+                echo 'Pipeline failed!'
+            }
         }
     }
 }
