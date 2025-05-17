@@ -1,7 +1,8 @@
-import requests
-import os
 import json
 import logging
+import os
+import re
+import requests
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
@@ -23,15 +24,19 @@ def read_snapshots():
     return "\n".join(snapshots)
 
 def clean_code_block(text):
+    """
+    自动提取第一个 markdown 代码块（```json ... ``` 或 '''json ... '''），只保留 JSON 内容
+    """
     text = text.strip()
-    # 去除三重反引号和三重单引号包裹
-    if text.startswith("```") or text.startswith("'''"):
-        first_newline = text.find('\n')
-        if first_newline != -1:
-            text = text[first_newline+1:]
-    if text.endswith("```") or text.endswith("'''"):
-        text = text.rsplit('\n', 1)[0]
-    return text.strip()
+    # 匹配 ```json ... ``` 或 '''json ... '''
+    match = re.search(r"(?:```json|'''json|```|''')\s*([\s\S]*?)\s*(?:```|''')", text, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    # 如果没有代码块，尝试直接找第一个 [ 开头的 JSON
+    idx = text.find('[')
+    if idx != -1:
+        return text[idx:].strip()
+    return text
 
 def generate_testcases_by_snapshot(snapshots):
     headers = {
