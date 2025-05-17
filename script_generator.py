@@ -64,8 +64,6 @@ def clean_code_block(text):
     # This regex keeps printable ASCII characters, and common whitespace (\t, \n, \r, \f, \v)
     # It also allows some common non-ASCII characters that might be in comments/docstrings (e.g., Chinese characters)
     # A more aggressive removal might be needed if errors persist, potentially restricting to ASCII only
-    # Let's refine this to be more aggressive if the issue persists
-    # For now, keep a balance to allow comments, but be strict on control characters
     # Allow common printable ASCII, basic whitespace, and a reduced range for common multi-byte chars
     text = re.sub(r'[^\x09\x0A\x0D\x20-\x7E\u4E00-\u9FFF]+', '', text)
 
@@ -368,7 +366,7 @@ if __name__ == "__main__":
     if os.path.exists(output_dir):
         logger.info(f"Cleaning up old script and error files in {output_dir}...")
         for filename in os.listdir(output_dir):
-            # Clean up .py, .error.py, and .raw_response.json files
+            # Clean up .py, .error.py (old and new naming), and .raw_response.json files
             if filename.endswith(".py") or filename.endswith(".error.py") or filename.endswith(".raw_response.json"):
                 try:
                     os.remove(os.path.join(output_dir, filename))
@@ -412,7 +410,8 @@ if __name__ == "__main__":
     successful_scripts = 0
     for i, test_case in enumerate(test_cases):
         script_filename = os.path.join(output_dir, f"test_playwright_{i+1}.py")
-        error_filename = os.path.join(output_dir, f"test_playwright_{i+1}.error.py")
+        # Modified error file naming
+        error_filename = os.path.join(output_dir, f"non_test_playwright_{i+1}.error.py")
         raw_response_filename = os.path.join(output_dir, f"test_playwright_{i+1}.raw_response.json")
 
 
@@ -444,12 +443,21 @@ if __name__ == "__main__":
                 logger.info(f"成功为用例 '{test_case.get('scene', f'用例 {i+1}')}' 生成脚本: {script_filename}")
                 successful_scripts += 1
                 # If script generated successfully, ensure no old error file exists for this test
+                # Clean up both old and new naming conventions for error files
+                old_error_filename = os.path.join(output_dir, f"test_playwright_{i+1}.error.py")
                 if os.path.exists(error_filename):
                      try:
                           os.remove(error_filename)
-                          logger.debug(f"Removed old error file for successful script: {error_filename}")
+                          logger.debug(f"Removed error file: {error_filename}")
                      except OSError as e:
-                          logger.warning(f"Error removing old error file {error_filename}: {e}")
+                          logger.warning(f"Error removing error file {error_filename}: {e}")
+                if os.path.exists(old_error_filename):
+                     try:
+                          os.remove(old_error_filename)
+                          logger.debug(f"Removed old error file: {old_error_filename}")
+                     except OSError as e:
+                          logger.warning(f"Error removing old error file {old_error_filename}: {e}")
+
 
             except Exception as e:
                 logger.error(f"无法写入脚本文件 {script_filename}: {e}")

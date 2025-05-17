@@ -1,153 +1,220 @@
 """
-根据页面快照生成结构化功能测试用例模块
-调用deepseek-chat API将HTML快照转为测试用例
+测试用例生成模块
+根据页面快照生成结构化测试用例 (testcases.json)
 """
-
-import requests
-import os
 import json
-import logging
+import os
+import requests
 import re
+from loguru import logger
+import sys
+import traceback # Import traceback module
+
+# Remove sys.stdout.reconfigure and sys.stderr.reconfigure for broader Python version compatibility.
+# To ensure UTF-8 output, it's generally recommended to set the PYTHONIOENCODING environment variable
+# before running the script, or rely on the logging library's encoding settings.
+# sys.stdout.reconfigure(encoding='utf-8')
+# sys.stderr.reconfigure(encoding='utf-8')
+
+# 使用loguru进行日志记录，并确保日志文件使用UTF-8编码
+logger.add("testcase_generation.log", rotation="1 MB", encoding="utf-8")
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-
-def read_snapshots():
-    """
-    读取snapshots目录下的所有HTML快照文件内容
-    """
-    snapshots = []
-    if not os.path.exists("snapshots"):
-        logging.error("snapshots 目录不存在！")
-        return ""
-    for fname in os.listdir("snapshots"):
-        if fname.endswith(".html"):
-            try:
-                with open(os.path.join("snapshots", fname), "r", encoding="utf-8") as f:
-                    # 限制每个快照的大小，防止API请求过长
-                    content = f.read(10000) # 读取前10000个字符
-                    snapshots.append(f"页面 {fname} 快照:\n{content}")
-            except Exception as e:
-                logging.error(f"读取 {fname} 失败: {e}")
-    return "\n".join(snapshots)
-
 def clean_code_block(text):
     """
-    自动提取第一个 markdown 代码块（```json ... ``` 或 '''json ... '''），只保留 JSON 内容
-    若无代码块，尝试直接找第一个 [ 开头的 JSON
+    从AI返回的文本中提取JSON代码块，处理可能的Markdown标记。
+    如果提取失败，则尝试直接解析原始文本（在清理Markdown标记后）。
     """
+    # Decode bytes if necessary, assuming UTF-8
+    if isinstance(text, bytes):
+        text = text.decode('utf-8', errors='ignore')
+
+    # Remove potential Byte Order Mark (BOM)
+    text = text.lstrip('\ufeff')
+
+    # Enhanced regex to find potential JSON blocks, including those with or without language specifiers
+    json_match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+    if json_match:
+        logger.debug("Found JSON block using ```json``` or `````` markdown.")
+        extracted_text = json_match.group(1)
+        # Attempt to parse the extracted text as JSON
+        try:
+            json.loads(extracted_text)
+            logger.debug("Successfully parsed extracted JSON block.")
+            return extracted_text.strip()
+        except json.JSONDecodeError:
+            logger.warning("Extracted text from markdown block is not valid JSON. Trying fallback methods.")
+            # Fallback to cleaning markdown and trying to parse the whole text
+            pass # Continue to general markdown cleaning below
+
+    # If markdown block not found or not valid JSON, try cleaning general markdown
+    logger.debug("JSON markdown block not found or invalid. Trying general markdown cleaning.")
     text = text.strip()
-    # 匹配 ```json ... ``` 或 '''json ... ''' 或 ``` 或 '''
-    match = re.search(r"(?:```json|'''json|```|''')\s*([\s\S]*?)\s*(?:```|''')", text, re.IGNORECASE)
-    if match:
-        return match.group(1).strip()
-    # 如果没有代码块，尝试直接找第一个 [ 开头的 JSON
-    idx = text.find('[')
-    if idx != -1:
-        return text[idx:].strip()
-    return "" # 如果没有找到JSON结构，返回空字符串
+    # Remove leading/trailing ```, ```json, ```python etc.
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if len(lines) > 1:
+             first_line = lines[0].strip()
+             # If the first line is only ``` or starts with ``` and some word (like json, python)
+             if re.match(r"```\w*$", first_line) or first_line == "```":
+                 text = "\n".join(lines[1:])
+        text = text.rstrip("```").strip()
+
+    # Remove potential triple quotes ``` or ''' if AI uses them without markdown backticks
+    if text.startswith("'''"):
+         text = text[3:].strip()
+    if text.endswith("'''"):
+         text = text[:-3].strip()
+    if text.startswith('"""'):
+         text = text[3:].strip()
+    if text.endswith('"""'):
+         text = text[:-3].strip()
+
+    # Remove common non-printable characters (less aggressive than in script_generator if possible, to preserve text)
+    # Keep printable ASCII, basic whitespace, and common CJK range
+    text = re.sub(r'[^\x09\x0A\x0D\x20-\x7E\u4E00-\u9FFF]+', '', text)
+
+    return text.strip()
 
 
-def generate_testcases_by_snapshot(snapshots):
+def generate_testcases(page_snapshot_content):
     """
-    调用deepseek-chat API，将页面快照转为结构化测试用例
+    调用AI根据页面快照生成测试用例。
     """
     if not DEEPSEEK_API_KEY:
-        logging.error("DEEPSEEK_API_KEY 环境变量未设置，无法调用API！")
-        return ""
+        logger.error("DEEPSEEK_API_KEY not set.")
+        return None, "DEEPSEEK_API_KEY not set."
+
+    api_prompt_content = f"""
+请分析以下HTML页面快照内容，识别页面上的关键元素（如输入框、按钮、链接、复选框等），并根据这些元素和常见的用户交互流程，生成一份详细的、结构化的测试用例列表。
+
+请以JSON格式返回测试用例列表，格式如下：
+[
+    {{
+        "scene": "测试场景描述",
+        "steps": [
+            "步骤1",
+            "步骤2",
+            ...
+        ],
+        "expected": "预期结果描述"
+    }},
+    ...
+]
+
+请确保JSON格式严格正确，不要包含任何额外的文本或Markdown代码块标记（如```json或```）。
+在生成测试用例时，请考虑以下方面：
+- 输入字段的交互（输入文本，检查placeholder，检查输入类型）
+- 按钮的初始状态（可用/禁用）和点击功能
+- 链接的可见性和点击后的导航
+- 复选框和单选框的选中/取消选中状态
+- 表单的整体提交功能（输入有效/无效数据后的行为）
+- 页面上其他重要UI元素的可见性或状态
+
+页面快照内容:
+{page_snapshot_content}
+"""
 
     headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json",
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}"
     }
-    prompt = (
-        "请根据以下页面快照，自动分析页面结构和功能，生成结构化的功能测试用例，"
-        "每个用例包含scene, steps, expected三个字段，输出为JSON数组：\n"
-        "确保输出内容是严格的JSON数组格式，不要包含额外的文字或markdown标记。"
-        f"\n{snapshots}"
-    )
-    data = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}]}
+
+    data = {
+        "model": "deepseek-chat",
+        "messages": [
+            {"role": "user", "content": api_prompt_content}
+        ]
+    }
+
+    logger.info("开始调用AI生成测试用例...")
+    logger.debug(f"Prompt snippet sent to API: '{api_prompt_content[:200]}...'") # Log snippet of prompt
+
+
     try:
-        response = requests.post(
-            DEEPSEEK_API_URL, headers=headers, json=data, timeout=120
-        )
-        response.raise_for_status() # 检查HTTP响应状态
-        resp_json = response.json()
-        logging.info(f"AI原始返回: {resp_json}")
+        response = requests.post(DEEPSEEK_API_URL, headers=headers, json=data)
+        response.raise_for_status() # Raise an exception for bad status codes
+        response_data = response.json()
 
-        if "choices" not in resp_json or not resp_json["choices"]:
-            logging.error(f"AI返回内容异常或为空: {resp_json}")
-            return ""
-
-        content = resp_json["choices"][0]["message"]["content"]
-        # 先尝试清洗，再返回可能为JSON的字符串
-        cleaned_content = clean_code_block(content)
-
-        # 额外检查清洗后的内容是否像JSON，防止返回空字符串导致解析失败
-        if not cleaned_content.startswith("[") or not cleaned_content.endswith("]"):
-             logging.error(f"清洗后的内容不是有效的JSON数组结构: {cleaned_content}")
-             # 尝试从原始返回中查找第一个JSON结构作为兜底
-             fallback_match = re.search(r'(\\[.*?\\\])', content, re.DOTALL)
-             if fallback_match:
-                 logging.warning("尝试从原始返回中提取兜底JSON。")
-                 try:
-                     json.loads(fallback_match.group(1))
-                     return fallback_match.group(1)
-                 except Exception as e:
-                      logging.error(f"兜底JSON提取及校验失败: {e}")
-                      return ""
-             return ""
+        logger.info("AI原始响应接收成功。")
+        # Log snippet of AI response
+        if response_data and 'choices' in response_data and response_data['choices']:
+             ai_response_content = response_data['choices'][0]['message']['content']
+             logger.info(f"AI response content snippet: '{ai_response_content[:200]}...'")
+        else:
+            logger.warning("AI response format unexpected or empty.")
+            return None, "AI response format unexpected or empty."
 
 
-        return cleaned_content
+        # 清理AI返回的文本，提取JSON内容
+        cleaned_content = clean_code_block(ai_response_content)
+        logger.debug(f"Cleaned AI response content snippet: '{cleaned_content[:200]}...'")
+
+
+        # 尝试解析JSON
+        try:
+            testcases = json.loads(cleaned_content)
+            # Optional: Add schema validation here using jsonschema if you have a schema
+            # from jsonschema import validate
+            # schema = {...} # Define your schema
+            # validate(instance=testcases, schema=schema)
+            logger.info("成功解析AI生成的JSON。")
+            return testcases, None
+        except json.JSONDecodeError as e:
+            logger.error(f"解析AI生成的JSON失败: {e}")
+            logger.error(f"Attempted to parse: {cleaned_content}") # Log the content that failed parsing
+            logger.error(traceback.format_exc()) # Log the full traceback for JSONDecodeError
+            return None, f"解析AI生成的JSON失败: {e}"
+        except Exception as e:
+            logger.error(f"解析AI生成内容时发生意外错误: {e}")
+            logger.error(traceback.format_exc()) # Log the full traceback
+            return None, f"解析AI生成内容时发生意外错误: {e}"
+
 
     except requests.exceptions.RequestException as e:
-        logging.error(f"调用 deepseek-chat API 请求失败: {e}")
-        return ""
-    except json.JSONDecodeError as e:
-         logging.error(f"解析 deepseek-chat API 返回的JSON失败: {e}")
-         return ""
+        logger.error(f"调用DeepSeek API失败: {e}")
+        logger.error(traceback.format_exc()) # Log the full traceback
+        return None, f"调用DeepSeek API失败: {e}"
     except Exception as e:
-        logging.error(f"生成测试用例过程中发生未知错误: {e}")
-        return ""
+        logger.error(f"生成测试用例时发生意外错误: {e}")
+        logger.error(traceback.format_exc()) # Log the full traceback
+        return None, f"生成测试用例时发生意外错误: {e}"
 
 
+# --- Main Execution ---
 if __name__ == "__main__":
-    logging.info("开始生成测试用例...")
-    snapshots = read_snapshots()
-    if not snapshots:
-        logging.error("未获取到任何页面快照，无法生成测试用例。")
-        # 即使失败，也要创建一个空的 testcases.json，防止后续脚本报错
-        with open("testcases.json", "w", encoding="utf-8") as f:
-            f.write("[]") # 写入空JSON数组
-        exit(1)
+    snapshot_file = "page_snapshot.json" # Assuming snapshot is saved here
+    output_file = "testcases.json"
 
-    testcases_content = generate_testcases_by_snapshot(snapshots)
+    if not os.path.exists(snapshot_file):
+        logger.error(f"错误：找不到页面快照文件 {snapshot_file}。请先运行快照采集脚本。")
+        sys.exit(1) # Exit with a non-zero status code to indicate failure
 
-    if not testcases_content:
-        logging.error("未生成任何有效测试用例内容。")
-        with open("testcases.json", "w", encoding="utf-8") as f:
-            f.write("[]") # 写入空JSON数组
-        exit(1)
 
-    # 写入前再次校验JSON合法性
+    page_snapshot_content = ""
     try:
-        testcases_list = json.loads(testcases_content)
-        # 可选：检查是否是列表且包含用例
-        if not isinstance(testcases_list, list) or not testcases_list:
-             logging.warning("AI生成内容是合法JSON，但不是非空列表。写入空数组。")
-             with open("testcases.json", "w", encoding="utf-8") as f:
-                 f.write("[]")
-             exit(0) # 非致命错误，允许继续
+        with open(snapshot_file, 'r', encoding='utf-8') as f:
+            page_snapshot_content = f.read()
+        logger.info(f"成功加载页面快照文件 {snapshot_file}。")
     except Exception as e:
-        logging.error(f"AI生成内容不是合法JSON: {e}\n内容如下：\n{testcases_content}")
-        with open("testcases.json", "w", encoding="utf-8") as f:
-            f.write("[]") # 写入空JSON数组
-        exit(1) # 致命错误，终止流程
+        logger.error(f"读取页面快照文件 {snapshot_file} 失败: {e}")
+        logger.error(traceback.format_exc()) # Log the full traceback
+        sys.exit(1) # Exit with a non-zero status code if reading snapshot fails
 
-    with open("testcases.json", "w", encoding="utf-8") as f:
-        json.dump(testcases_list, f, ensure_ascii=False, indent=2)
 
-    logging.info(f"测试用例已成功保存到 testcases.json，共生成 {len(testcases_list)} 条用例。")
+    test_cases, error_message = generate_testcases(page_snapshot_content)
+
+    if test_cases:
+        try:
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump(test_cases, f, indent=2, ensure_ascii=False)
+            logger.info(f"测试用例已成功保存到 {output_file}，共生成 {len(test_cases)} 个测试用例。")
+        except Exception as e:
+             logger.error(f"无法将测试用例写入文件 {output_file}: {e}")
+             logger.error(traceback.format_exc()) # Log the full traceback
+             sys.exit(1) # Exit if writing testcases fails
+    else:
+        logger.error(f"生成测试用例失败: {error_message}")
+        sys.exit(1) # Exit with a non-zero status code if generation fails
