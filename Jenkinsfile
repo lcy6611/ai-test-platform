@@ -13,7 +13,6 @@ pipeline {
             steps {
                 bat 'pip install -r requirements.txt'
                 bat 'python -m playwright install'
-                // allure-pytest 建议直接写在 requirements.txt 里，无需单独安装
             }
         }
         stage('Page Snapshot') {
@@ -31,6 +30,11 @@ pipeline {
                 bat 'python script_generator.py'
             }
         }
+        stage('Check Selectors') {
+            steps {
+                bat 'python auto_check_selectors.py'
+            }
+        }
         stage('Run Tests') {
             steps {
                 bat 'python run_tests.py'
@@ -43,7 +47,6 @@ pipeline {
         }
         stage('Re-Run Healed Tests') {
             steps {
-                // Windows 下忽略 pytest 失败可用如下写法
                 bat '''
                 pytest playwright_test_*.py.healed --alluredir=allure-results
                 exit 0

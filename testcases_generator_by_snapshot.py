@@ -3,7 +3,7 @@ import os
 import json
 import logging
 
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "sk-2c7a9791906b429fb5732f2a2e88fbd5")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "sk-xxx")
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -24,7 +24,6 @@ def read_snapshots():
 
 def clean_code_block(text):
     text = text.strip()
-    # 去除三重反引号或单引号包裹
     if text.startswith("```"):
         text = text.split('\n', 1)[-1]
         if text.endswith("```"):
@@ -66,7 +65,6 @@ if __name__ == "__main__":
     testcases = generate_testcases_by_snapshot(snapshots)
     testcases = clean_code_block(testcases)
     try:
-        # 校验并格式化
         testcases_obj = json.loads(testcases)
         with open("testcases.json", "w", encoding="utf-8") as f:
             json.dump(testcases_obj, f, ensure_ascii=False, indent=2)
