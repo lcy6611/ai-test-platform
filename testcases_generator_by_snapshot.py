@@ -3,7 +3,7 @@ import os
 import json
 import logging
 
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "sk-xxx")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -51,7 +51,11 @@ def generate_testcases_by_snapshot(snapshots):
     try:
         response = requests.post(DEEPSEEK_API_URL, headers=headers, json=data, timeout=120)
         response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
+        resp_json = response.json()
+        if "choices" not in resp_json:
+            logging.error(f"AI返回内容异常: {resp_json}")
+            return ""
+        content = resp_json["choices"][0]["message"]["content"]
         return clean_code_block(content)
     except Exception as e:
         logging.error(f"调用 deepseek-chat 失败: {e}")
