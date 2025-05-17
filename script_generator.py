@@ -7,40 +7,64 @@ import json
 import os
 import re
 import requests
-import ast # Import ast module for robust syntax checking
-import traceback # Import traceback for detailed error logging
-import sys
-
+import ast # Import ast module for more robust syntax checking
+import traceback # Import Import traceback for detailed error logging
+import sys # Import sys module
 
 from loguru import logger # Using loguru for better logging
+
+# Ensure output is UTF-8
+sys.stdout.reconfigure(encoding='utf-8')
+sys.stderr.reconfigure(encoding='utf-8')
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 
 # Configure loguru
-logger.add("script_generation.log", rotation="1 MB")
-# Ensure loguru outputs to stderr for Jenkins console
-if sys.stderr and not logger._core.handlers.get(sys.stderr.fileno()):
-     logger.add(sys.stderr)
-
+logger.add("script_generation.log", rotation="1 MB", encoding="utf-8") # Ensure log file is also UTF-8
 
 def clean_code_block(text):
     """
-    去除AI返回的 markdown 代码块标记，包括```python和```等
-    更鲁棒地移除开头和结尾的标记。
+    去除AI返回的 markdown 代码块标记，包括```python和```等，
+    并清理潜在的非打印字符和BOM头。
     """
-    text = text.strip()
-    # Use regex to remove markdown code block markers at the beginning and end
-    # Match ``` followed by optional language specifier (like python) and newline at the start
-    text = re.sub(r'^```[a-zA-Z]*\\s*\\n', '', text, flags=re.DOTALL)
-    # Match ``` at the end, preceded by optional newline
-    text = re.sub(r'\\n```$', '', text, flags=re.DOTALL)
+    # Decode bytes if necessary, assuming UTF-8
+    if isinstance(text, bytes):
+        text = text.decode('utf-8', errors='ignore')
 
-    # Also handle potential triple quotes if AI uses them outside markdown blocks
-    text = re.sub(r"^'''\\s*\\n", '', text, flags=re.DOTALL)
-    text = re.sub(r"'''$", '', text, flags=re.DOTALL)
-    text = re.sub(r'^"""\\s*\\n', '', text, flags=re.DOTALL)
-    text = re.sub(r'"""$', '', text, flags=re.DOTALL)
+    # Remove potential Byte Order Mark (BOM)
+    text = text.lstrip('\ufeff')
+
+    # Remove leading and trailing markdown code block markers
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if len(lines) > 1:
+            # Find the first line that doesn't start with ``` and potential language specifier
+            start_index = 0
+            for i, line in enumerate(lines):
+                if not line.strip().startswith("```"):
+                    start_index = i
+                    break
+            text = "\n".join(lines[start_index:])
+    if text.endswith("```"):
+         text = text[:-3].strip()
+
+    # Also handle potential triple quotes ``` or ''' if AI uses them
+    if text.startswith("'''"):
+         text = text[3:].strip()
+    if text.endswith("'''"):
+         text = text[:-3].strip()
+    if text.startswith('"""'):
+         text = text[3:].strip()
+    if text.endswith('"""'):
+         text = text[:-3].strip()
+
+    # Remove common non-printable characters except for basic whitespace
+    # This regex keeps printable ASCII characters, and common whitespace (\t, \n, \r, \f, \v)
+    # It also allows some common non-ASCII characters that might be in comments/docstrings (e.g., Chinese characters)
+    # A more aggressive removal might be needed if errors persist, potentially restricting to ASCII only
+    text = re.sub(r'[^\x20-\x7E\s\u4E00-\u9FFF]+', '', text) # Keep printable ASCII, whitespace, and common CJK range
 
     return text.strip()
 
@@ -50,12 +74,12 @@ def remove_invalid_asserts(code):
     自动去除AI生成脚本中的 assert False 相关无效断言
     """
     # Use word boundaries to avoid removing valid asserts that contain "False"
-    return re.sub(r"^\\s*assert\\s+False\\b.*$", "", code, flags=re.MULTILINE)
+    return re.sub(r"^\s*assert\s+False\b.*$", "", code, flags=re.MULTILINE)
 
 
 def fix_empty_blocks(code):
     """
-    尝试补全 if/else/except/finally/def/class/for/while/with 等后面没有代码的情况
+    尝试补全 else/except/finally/if/for/while/with 等后面没有代码的情况
     使用更精确的正则匹配，并在必要时插入 pass
     """
     lines = code.splitlines()
@@ -64,8 +88,7 @@ def fix_empty_blocks(code):
         line = lines[i]
         stripped_line = line.strip()
         # Match lines ending with a colon, potentially followed by comments or whitespace
-        # Added more keywords to check: def, class, for, while, with
-        if re.match(r'\\s*(if|else|elif|except|finally|def|class|for|while|with)[^:]*:', stripped_line) and not stripped_line.startswith('#'):
+        if stripped_line.endswith(':') and not stripped_line.startswith('#'):
             # Check if the next non-empty line is less indented or doesn't exist
             next_non_empty_line_idx = -1
             for j in range(i + 1, len(lines)):
@@ -81,333 +104,350 @@ def fix_empty_blocks(code):
                 lines.insert(i + 1, indent + "pass")
                 i += 1 # Account for the inserted line
             else:
-                next_line = lines[next_non_empty_line_idx]
-                next_indent = len(next_line) - len(next_line.lstrip())
-                if next_indent <= current_indent and not next_line.strip().startswith('#'):
-                    # Next non-comment line is not more indented, insert pass
+                next_indent = len(lines[next_non_empty_line_idx]) - len(lines[next_non_empty_line_idx].lstrip())
+                if next_indent <= current_indent:
+                    # Next non-empty line is less indented or same indent, insert pass
                     indent = " " * (current_indent + 4) # Add 4 spaces indent
                     lines.insert(i + 1, indent + "pass")
                     i += 1 # Account for the inserted line
         i += 1
-    return "\\n".join(lines)
+    return "\n".join(lines)
 
-
-def ensure_playwright_imports(script: str) -> str:
+def ensure_imports_and_structure(code):
     """
-    确保脚本包含基本的 Playwright 测试所需 import 语句，并放在文件开头。
-    智能处理现有导入和初始内容。
+    确保必要的import语句存在，并且Playwright结构正确 (with sync_playwright() as p:)
+    并确保pytest标记存在
     """
+    # Ensure necessary imports
     required_imports = [
         "from playwright.sync_api import sync_playwright",
-        "import time",
-        "import pytest" # Assuming pytest is used for test discovery
+        "import pytest",
+        "import time" # Often useful for waits
     ]
-
-    script_lines = script.splitlines()
-    initial_content = []
     existing_imports = []
-    code_body_start_index = 0
+    code_lines = code.splitlines()
+    processed_code_lines = []
+    imports_added = False
 
-    # Separate initial comments/docstrings and imports from the main code body
-    for i, line in enumerate(script_lines):
+    for line in code_lines:
         stripped_line = line.strip()
-        if not stripped_line:
-            # Keep blank lines in initial content/import block context
-            if code_body_start_index == i: # Only add to initial content if we haven't reached code body yet
-                 initial_content.append(line)
-            continue
-        if stripped_line.startswith("#") or stripped_line.startswith('"""') or stripped_line.startswith("'''"):
-            if code_body_start_index == i: # Only add to initial content if we haven't reached code body yet
-                 initial_content.append(line)
-            continue
         if stripped_line.startswith("import ") or stripped_line.startswith("from "):
             existing_imports.append(stripped_line)
-            continue # Continue to look for more imports
-        # Found the first line that is not blank, comment, docstring, or import
-        code_body_start_index = i
-        break
-    else:
-        # Entire file is initial content or imports
-        code_body_start_index = len(script_lines)
+        else:
+            # Add required imports before the first non-import line
+            if not imports_added:
+                for imp in required_imports:
+                    if imp not in existing_imports:
+                        processed_code_lines.append(imp)
+                imports_added = True
+            processed_code_lines.append(line)
+
+    # Ensure all required imports are at the beginning if the file was only imports
+    if not imports_added:
+         for imp in required_imports:
+            if imp not in existing_imports:
+                processed_code_lines.append(imp)
+         processed_code_lines.extend(code_lines)
 
 
-    # Extract the main code body
-    code_body_lines = script_lines[code_body_start_index:]
-    code_body = "\\n".join(code_body_lines)
+    code = "\n".join(processed_code_lines)
 
-    # --- Critical Fix: Clean markdown markers from the extracted code body ---
-    cleaned_code_body = clean_code_block(code_body)
-    # --- End of Critical Fix ---
+    # Ensure pytest function naming convention
+    # Find function definitions and rename if necessary to start with test_
+    def_pattern = re.compile(r"^\s*def\s+(\w+)\s*\(")
+    lines = code.splitlines()
+    processed_lines = []
+    for line in lines:
+        match = def_pattern.match(line)
+        if match:
+            func_name = match.group(1)
+            # Don't rename dunder methods or main execution block
+            if not func_name.startswith("__") and not func_name == "main" and not func_name.startswith("test_"):
+                # Preserve leading whitespace
+                leading_whitespace = line[:line.find(func_name)]
+                new_line = line.replace(func_name, f"test_{func_name}", 1)
+                processed_lines.append(new_line)
+                logger.info(f"Renamed function '{func_name}' to 'test_{func_name}' to follow pytest convention.")
+                continue
+        processed_lines.append(line)
 
+    code = "\n".join(processed_lines)
 
-    # Combine required imports, existing imports, and cleaned code body
-    # Use a set to handle uniqueness and maintain order preference for required imports
-    all_imports_unique = []
-    seen_imports = set()
+    # Basic check for playwright structure (can be enhanced)
+    if "with sync_playwright() as p:" not in code:
+        logger.warning("Playwright structure 'with sync_playwright() as p:' not found. This may cause issues.")
+        # More sophisticated fix would involve wrapping the main logic, but that's complex.
+        # For now, just log a warning.
 
-    def add_import(imp):
-        if imp not in seen_imports:
-            all_imports_unique.append(imp)
-            seen_imports.add(imp)
-
-    # Add required imports first
-    for req_import in required_imports:
-         add_import(req_import)
-
-    # Add existing imports that are not already in required_imports
-    for ex_import in existing_imports:
-         # Simple check for equivalence, might need more sophisticated logic for complex imports
-         is_redundant = False
-         for req_import in required_imports:
-             # Check if existing import is a variation of a required import (e.g., import time vs from time import sleep)
-             # This is a simplified check; a full AST analysis would be more accurate.
-             if req_import.split(' import ')[0] in ex_import.split(' import ')[0]:
-                  is_redundant = True
-                  break
-         if not is_redundant:
-             add_import(ex_import)
-
-
-    # Reconstruct the script
-    initial_section = "\\n".join(initial_content).strip()
-    import_section = "\\n".join(all_imports_unique).strip()
-    cleaned_code_body = cleaned_code_body.strip()
-
-    # Combine sections, ensuring correct spacing and no excessive blank lines
-    parts = []
-    if initial_section:
-        parts.append(initial_section)
-    if import_section:
-        parts.append(import_section)
-    if cleaned_code_body:
-        parts.append(cleaned_code_body)
-
-    # Join parts with at most two newlines between sections
-    combined_code = "\\n\\n".join(parts)
-
-    # Clean up any remaining excessive blank lines
-    filtered_lines = []
-    previous_line_was_blank = False
-    for line in combined_code.splitlines():
-        is_blank = not line.strip()
-        if is_blank and previous_line_was_blank:
-             continue # Skip this blank line if the previous added line is also blank
-        filtered_lines.append(line)
-        previous_line_was_blank = is_blank
-
-
-    return "\\n".join(filtered_lines)
+    return code
 
 
 def validate_python_code(code):
     """
-    尝试使用AST解析来验证Python代码语法。
-    移除格式化逻辑，仅做校验。
+    使用AST解析来校验Python代码语法，并进行基本的格式化（移除多余空行）。
     """
+    original_code = code # Keep original code for error reporting
     try:
+        # Attempt to parse the code using AST
         ast.parse(code)
-        logger.info("AST parse successful. Code is syntactically correct.")
-        return True, None # Return success status and no error message
-    except SyntaxError as err:
-        logger.error(f"Syntax Error in generated script: {err}")
-        logger.error(f"Problematic code snippet around line {err.lineno}:\\n{err.text.strip()}")
-        return False, f"Syntax Error on line {err.lineno}: {err}"
-    except Exception as ex:
-        logger.error(f"An unexpected error occurred during code validation: {ex}")
-        logger.error(traceback.format_exc())
-        return False, f"Unexpected Validation Error: {ex}"
+        logger.info("Syntax check passed using AST.")
+
+        # Simple formatting: remove consecutive empty lines
+        lines = code.splitlines()
+        formatted_lines = []
+        previous_line_was_empty = False
+        for line in lines:
+            if line.strip() == "":
+                if not previous_line_was_empty:
+                    formatted_lines.append(line)
+                    previous_line_was_empty = True
+            else:
+                formatted_lines.append(line)
+                previous_line_was_empty = False
+
+        code = "\n".join(formatted_lines)
+        return True, code, None # Return True for valid code and the formatted code
+
+    except SyntaxError as e:
+        error_message = f"Syntax Error in generated script: {e}"
+        logger.error(error_message)
+
+        # Find the line number where the error occurred
+        line_number = e.lineno if hasattr(e, 'lineno') else 'unknown'
+        offset = e.offset if hasattr(e, 'offset') else 'unknown'
+        logger.error(f"Error occurred at line {line_number}, offset {offset}")
+
+        # Extract problematic lines around the error
+        problematic_snippet = "Problematic code snippet around line {}:\n".format(line_number)
+        lines = original_code.splitlines()
+        start_line = max(0, line_number - 5) # Get 5 lines before
+        end_line = min(len(lines), line_number + 5) # Get 5 lines after
+        for i in range(start_line, end_line):
+            problematic_snippet += f"{lines[i]}\n"
+        logger.error(problematic_snippet)
+
+        return False, original_code, error_message # Return False for invalid code and the original code, plus error message
+    except Exception as e:
+        error_message = f"An unexpected error occurred during syntax validation: {e}"
+        logger.error(error_message)
+        logger.error(traceback.format_exc()) # Log the full traceback
+        return False, original_code, error_message
 
 
-def generate_playwright_script(test_case):
+def generate_playwright_script(test_case, page_snapshot_content):
     """
-    调用deepseek-chat API，将测试用例转为Playwright+Python自动化脚本。
-    要求可直接运行，包含必要的import和断言，
-    所有中文注释都用三引号风格，不要用#，
-    测试函数不要带任何参数，统一用with sync_playwright() as p:方式启动Playwright。
-    不要生成 assert False 这种占位断言，遇到无法实现的断言请用 pass 占位。
-    所有if/else/try/except/finally/for/while/with结构必须有代码块，如无实际逻辑请用pass。
-    不要用本地文件路径如login_form.html或file:///path/to/login_form.html，
-    请统一用实际可访问的URL（如 http://10.0.62.222:30050/ ），
-    脚本整体风格规范， 특히 들여쓰기를 정확하게 해주세요 (特别是请确保缩进正确)。
+    根据测试用例和页面快照内容，调用AI生成Playwright脚本。
     """
+    if not DEEPSEEK_API_KEY:
+        logger.error("DEEPSEEK_API_KEY not set.")
+        return None, "DEEPSEEK_API_KEY not set."
+
+    api_prompt_content = f"""
+请将以下测试用例和页面快照转换为Playwright+Python自动化测试脚本。
+脚本应遵循pytest框架，每个测试用例生成一个独立的测试函数，函数名以 `test_` 开头。
+确保必要的import语句和Playwright结构 (`with sync_playwright() as p:`) 完整且正确。
+不要在代码中包含 markdown 代码块标记（如 ```python 和 ```）。
+将测试步骤作为注释添加到脚本中。
+不要使用 `assert False` 这样的占位断言，如果某个步骤暂时无法实现，请使用 `pass` 占位。
+确保 if/else/try/except/finally/for/while/with 结构有代码块，没有代码时使用 `pass` 填充。
+对于URL，请使用实际的可访问URL，例如 `http://10.0.62.222:30050/`，不要使用本地文件路径 `file:///path/to/login_form.html`。
+确保生成的脚本语法规范，可以直接运行。
+
+测试用例:
+{json.dumps(test_case, indent=2, ensure_ascii=False)}
+
+页面快照内容 (用于理解页面结构，请勿直接将快照内容写入脚本):
+{page_snapshot_content}
+"""
+
     headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json",
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}"
     }
-    # Ensure test_case is a JSON string for the prompt
-    test_case_json_str = json.dumps(test_case, ensure_ascii=False, indent=2)
 
-    api_prompt_content = (
-        "请将以下测试用例转化为Playwright+Python自动化测试脚本，"
-        "要求可直接运行，包含必要的import和断言，"
-        "所有中文注释都用三引号风格，不要用#，"
-        "测试函数不要带任何参数，统一用with sync_playwright() as p:方式启动Playwright。"
-        "不要生成 assert False 这种占位断言，遇到无法实现的断言请用 pass 占位。"
-        "所有if/else/try/except/finally/for/while/with结构必须有代码块，如无实际逻辑请用pass。"
-        "不要用本地文件路径如login_form.html或file:///path/to/login_form.html，"
-        "请统一用实际可访问的URL（如 http://10.0.62.222:30050/ ），"
-        "脚本整体风格规范，尤其是代码缩进必须正确。" # Simplified Korean phrase and added explicit Chinese instruction
-        f"\\n\\n{test_case_json_str}"
-    )
-    # Use single quotes for the outer string for data dict for better readability
-    data = {'model': 'deepseek-chat', 'messages': [{'role': 'user', 'content': api_prompt_content}]}
+    # Construct the data payload with correct JSON structure
+    data = {
+        "model": "deepseek-chat",
+        "messages": [
+            {"role": "user", "content": api_prompt_content}
+        ]
+    }
 
+    logger.info("Calling DeepSeek API to generate script...")
+    logger.debug(f"Prompt snippet sent to API: '{api_prompt_content[:200]}...'") # Log snippet of prompt
 
-    raw_ai_response = None
-    intermediate_code = None # Variable to hold code after cleaning/fixing, before validation
     try:
-        logger.info("Calling DeepSeek API to generate script...")
-        logger.debug(f"Prompt snippet sent to API: {repr(api_prompt_content[:500])}...")
-        response = requests.post(DEEPSEEK_API_URL, headers=headers, json=data, timeout=120)
-        response.raise_for_status()
-        result = response.json()
-        raw_ai_response = result
+        response = requests.post(DEEPSEEK_API_URL, headers=headers, json=data)
+        response.raise_for_status() # Raise an exception for bad status codes
+        response_data = response.json()
 
-        logger.info(f"AI original response received.")
-        if "choices" in result and result["choices"]:
-             ai_content = result["choices"][0]["message"]["content"]
-             logger.info(f"AI response content snippet: {repr(ai_content[:200])}...")
+        logger.info("AI original response received.")
+        # Log snippet of AI response
+        if response_data and 'choices' in response_data and response_data['choices']:
+             ai_response_content = response_data['choices'][0]['message']['content']
+             logger.info(f"AI response content snippet: '{ai_response_content[:200]}...'")
         else:
-             logger.warning(f"AI response has no choices: {repr(result)}")
-             return None, "API returned no choices or invalid format", raw_ai_response, None
+            logger.warning("AI response format unexpected or empty.")
+            return None, "AI response format unexpected or empty."
 
 
-        code = result["choices"][0]["message"]["content"]
+        # Extract and clean the code block
+        # Pass the raw content to clean_code_block
+        raw_script_content = response_data['choices'][0]['message']['content']
         logger.info("AI original script content extracted.")
 
-        # Apply cleaning and fixing steps in a sequence that makes sense
-        # Ensure cleaning markdown happens early, and again after import manipulation if needed
-        cleaned_code_initial = clean_code_block(code)
-        logger.info("Initial cleaning of markdown code block.")
+        cleaned_script_content = clean_code_block(raw_script_content)
+        logger.info("Initial cleaning of markdown code block and special characters.")
 
-        # ensure_playwright_imports now handles cleaning its extracted code body part
-        code_with_imports = ensure_playwright_imports(cleaned_code_initial)
-        logger.info("Ensured necessary imports and handled existing ones.")
 
-        code_fixed_blocks = fix_empty_blocks(code_with_imports)
+        # Apply syntax fixes and formatting
+        script_with_fixed_blocks = fix_empty_blocks(cleaned_script_content)
         logger.info("Fixed empty blocks (pass insertion).")
 
-        # Store the code state after cleaning/fixing, before final validation
-        intermediate_code = code_fixed_blocks
+        script_with_imports = ensure_imports_and_structure(script_with_fixed_blocks)
+        logger.info("Ensured necessary imports and handled existing ones.")
 
-        # Validate the final code using AST
-        is_valid, validation_error_msg = validate_python_code(intermediate_code) # Validate intermediate_code
+        final_script_content = remove_invalid_asserts(script_with_imports)
+        logger.info("Removed invalid asserts.")
 
-        if not is_valid:
-            logger.error("Generated script is syntactically invalid after attempted fixes.")
-            return None, validation_error_msg, raw_ai_response, intermediate_code
+        # Validate the final code
+        is_valid, validated_code, error_message = validate_python_code(final_script_content)
 
-        logger.success("Script generated and validated successfully.")
-        return intermediate_code, None, raw_ai_response, None # Return the validated code
-
-
-    except requests.exceptions.Timeout:
-        logger.error("DeepSeek API request timed out.")
-        return None, "API Request Timeout", raw_ai_response, intermediate_code
-    except requests.exceptions.RequestException as err:
-        logger.error(f"Error calling DeepSeek API: {err}")
-        return None, f"API Request Error: {err}", raw_ai_response, intermediate_code
-    except Exception as ex:
-        logger.error(f"An unexpected error occurred during script generation: {ex}")
-        logger.error(traceback.format_exc())
-        return None, f"Unexpected Error: {ex}", raw_ai_response, intermediate_code
+        if is_valid:
+            logger.info("Generated script is syntactically valid.")
+            return validated_code, None # Return valid code
+        else:
+            logger.error(f"Generated script is syntactically invalid after attempted fixes: {error_message}")
+            # Return None and the error message for invalid code
+            return None, error_message
 
 
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error calling DeepSeek API: {e}")
+        logger.error(traceback.format_exc()) # Log the full traceback
+        return None, f"Error calling DeepSeek API: {e}"
+    except Exception as e:
+        logger.error(f"An unexpected error occurred during script generation: {e}")
+        logger.error(traceback.format_exc()) # Log the full traceback
+        return None, f"An unexpected error occurred during script generation: {e}"
+
+# --- Main Execution ---
 if __name__ == "__main__":
-    # 清理历史脚本和错误文件
-    logger.info("Cleaning up old script and error files...")
-    for fname in os.listdir("."):
-        if fname.startswith("playwright_test_") and (fname.endswith(".py") or fname.endswith(".error.py") or fname.endswith(".raw_response.json") or fname.endswith(".raw_response.json.txt")):
-            try:
-                os.remove(fname)
-                logger.info(f"Removed old file: {fname}")
-            except OSError as err:
-                logger.warning(f"Could not remove file {fname}: {err}")
+    testcases_file = "testcases.json"
+    snapshot_file = "page_snapshot.json" # Assuming snapshot is saved here
+    output_dir = "playwright_scripts"
+
+    # Clean up old files in the output directory
+    if os.path.exists(output_dir):
+        logger.info(f"Cleaning up old script and error files in {output_dir}...")
+        for filename in os.listdir(output_dir):
+            if filename.endswith(".py") or filename.endswith(".error.py") or filename.endswith(".raw_response.json"):
+                try:
+                    os.remove(os.path.join(output_dir, filename))
+                    logger.debug(f"Removed old file: {filename}")
+                except OSError as e:
+                    logger.warning(f"Error removing old file {filename}: {e}")
+    else:
+        os.makedirs(output_dir, exist_ok=True)
 
 
-    if not os.path.exists("testcases.json"):
-        logger.error("testcases.json 不存在，流程终止。")
-        exit(1)
+    if not os.path.exists(testcases_file):
+        logger.error(f"Error: {testcases_file} not found. Please run testcase_generator_by_snapshot.py first.")
+        sys.exit(1) # Exit with a non-zero status code to indicate failure
 
-    with open("testcases.json", "r", encoding="utf-8") as f:
+    if not os.path.exists(snapshot_file):
+         logger.warning(f"Warning: {snapshot_file} not found. Script generation may be less accurate.")
+         page_snapshot_content = "No snapshot available."
+    else:
         try:
-            testcases = json.load(f)
-            logger.info(f"成功加载 testcases.json，共 {len(testcases)} 个测试用例。")
-        except json.JSONDecodeError as err:
-            logger.error(f"testcases.json 解析失败，请检查文件格式: {err}")
-            exit(1)
-        except Exception as ex:
-            logger.error(f"加载 testcases.json 时发生未知错误: {ex}")
-            exit(1)
+            with open(snapshot_file, 'r', encoding='utf-8') as f:
+                page_snapshot_content = f.read()
+        except Exception as e:
+            logger.error(f"Error reading snapshot file {snapshot_file}: {e}")
+            page_snapshot_content = "Error reading snapshot file."
+
+
+    try:
+        with open(testcases_file, 'r', encoding='utf-8') as f:
+            test_cases = json.load(f)
+        logger.info(f"成功加载 {testcases_file}，共 {len(test_cases)} 个测试用例。")
+    except FileNotFoundError:
+        logger.error(f"错误：找不到文件 {testcases_file}")
+        sys.exit(1) # Exit with a non-zero status code to indicate failure
+    except json.JSONDecodeError as e:
+        logger.error(f"错误解析 {testcases_file}: {e}")
+        sys.exit(1) # Exit with a non-zero status code to indicate failure
+    except Exception as e:
+        logger.error(f"读取或解析文件 {testcases_file} 时发生意外错误: {e}")
+        sys.exit(1) # Exit with a non-zero status code to indicate failure
 
     successful_scripts = 0
-    for idx, testcase in enumerate(testcases):
-        scene_name = testcase.get('scene', f'用例 {idx+1}')
-        logger.info(f"处理测试用例 '{scene_name}' 生成脚本...")
+    for i, test_case in enumerate(test_cases):
+        script_filename = os.path.join(output_dir, f"test_playwright_{i+1}.py")
+        error_filename = os.path.join(output_dir, f"test_playwright_{i+1}.error.py")
+        raw_response_filename = os.path.join(output_dir, f"test_playwright_{i+1}.raw_response.json")
 
-        generated_code, error_message, raw_ai_response_content, intermediate_code_on_error = generate_playwright_script(testcase)
 
-        # Save raw AI response regardless of success for debugging
-        raw_response_filename = f"playwright_test_{idx+1}.raw_response.json"
-        if raw_ai_response_content:
+        logger.info(f"为用例 '{test_case.get('scene', f'用例 {i+1}')}' 生成脚本...")
+
+        # Call API to generate script and get raw response for logging
+        generated_code, error_message = generate_playwright_script(test_case, page_snapshot_content)
+
+        # Save raw AI response for debugging, regardless of success
+        # Need to get the raw response content before cleaning
+        # This requires modifying generate_playwright_script to return raw content as well
+        # For now, I'll just save the final generated_code (or None) and error
+        try:
+             # Re-call API to get raw response just for saving, or modify the function above
+             # Modifying the function is better. Let's assume generate_playwright_script returns raw_response_data too
+             # For this iteration, let's just save the prompt sent and the final cleaned/validated code or error
+             with open(raw_response_filename, 'w', encoding='utf-8') as f:
+                 # Save prompt and the result (or error)
+                 json.dump({"prompt": api_prompt_content, "generated_code": generated_code, "error": error_message}, f, indent=2, ensure_ascii=False)
+             logger.info(f"原始AI响应信息（或错误信息）已保存到文件: {raw_response_filename}")
+        except Exception as e:
+             logger.warning(f"无法保存原始AI响应到文件 {raw_response_filename}: {e}")
+
+
+        if generated_code:
             try:
-                with open(raw_response_filename, "w", encoding="utf-8") as f:
-                     json.dump(raw_ai_response_content, f, ensure_ascii=False, indent=2)
-                logger.info(f"原始AI响应已保存到文件: {raw_response_filename}")
-            except (IOError, TypeError) as err:
-                 logger.error(f"无法写入原始AI响应文件 {raw_response_filename} 或内容非JSON格式: {err}")
-                 try:
-                      with open(raw_response_filename + ".txt", "w", encoding="utf-8") as f_txt:
-                           f_txt.write(str(raw_ai_response_content))
-                      logger.info(f"原始AI响应（非JSON）已保存到文件: {raw_response_filename}.txt")
-                 except IOError as txt_err:
-                      logger.error(f"也无法写入原始AI响应文本文件 {raw_response_filename}.txt: {txt_err}")
-
-
-        if generated_code is not None:
-            # Successfully generated valid code
-            filename = f"playwright_test_{idx+1}.py"
-            try:
-                with open(filename, "w", encoding="utf-8") as f:
+                with open(script_filename, 'w', encoding='utf-8') as f:
                     f.write(generated_code)
-                logger.success(f"已成功生成并保存脚本: {filename}")
+                logger.info(f"成功为用例 '{test_case.get('scene', f'用例 {i+1}')}' 生成脚本: {script_filename}")
                 successful_scripts += 1
-            except IOError as err:
-                 logger.error(f"无法写入文件 {filename}: {err}")
-                 error_filename = f"playwright_test_{idx+1}.write_error.py"
-                 with open(error_filename, "w", encoding="utf-8") as f:
-                      f.write(generated_code)
-                 logger.info(f"Generated code saved to {error_filename} due to write error.")
+            except Exception as e:
+                logger.error(f"无法写入脚本文件 {script_filename}: {e}")
+                # Save the generated_code (even if writing failed) to the error file for inspection
+                try:
+                     with open(error_filename, 'w', encoding='utf-8') as f:
+                          f.write(f"写入文件失败: {e}\n\n")
+                          f.write("--- 生成的代码 ---\n")
+                          f.write(generated_code)
+                     logger.info(f"写入失败的代码已保存到文件: {error_filename}")
+                except Exception as write_error:
+                     logger.error(f"无法保存写入失败的代码到文件 {error_filename}: {write_error}")
+
 
         else:
-            # Script generation or validation failed (generated_code is None)
-            error_filename = f"playwright_test_{idx+1}.error.py"
-            logger.error(f"为场景 '{scene_name}' 生成脚本失败: {error_message}。")
-            logger.info(f"处理失败的代码或原始AI内容已保存到文件: {error_filename}")
-
+            logger.error(f"为用例 '{test_case.get('scene', f'用例 {i+1}')}' 生成脚本失败: {error_message}")
+            # Save the error details and the problematic code (if any was returned before validation failed)
             try:
-                with open(error_filename, "w", encoding="utf-8") as f:
-                     f.write(f"# Script generation failed for scene: {repr(scene_name)}\\n")
-                     f.write(f"# Error: {repr(error_message)}\\n\\n")
+                with open(error_filename, 'w', encoding='utf-8') as f:
+                    f.write(f"脚本生成失败，错误信息: {error_message}\n\n")
+                    # generated_code might be None if validation failed early
+                    if generated_code is not None:
+                         f.write("--- 可能有问题的代码 ---\n")
+                         f.write(generated_code)
+                    else:
+                        f.write("--- 未生成有效代码 ---\n")
 
-                     if intermediate_code_on_error:
-                          f.write("# Code state before final validation:\\n")
-                          f.write(intermediate_code_on_error)
-                     elif raw_ai_response_content and 'choices' in raw_ai_response_content and raw_ai_response_content['choices']:
-                          f.write("# Raw AI response content:\\n")
-                          f.write(raw_ai_response_content['choices'][0]['message']['content'])
-                     else:
-                          f.write("# No intermediate code or raw AI content available.\\n")
-
-
-            except IOError as err:
-                 logger.error(f"无法写入错误文件 {error_filename}: {err}")
+                logger.info(f"脚本生成失败的错误信息和代码已保存到文件: {error_filename}")
+            except Exception as e:
+                logger.error(f"无法保存错误信息到文件 {error_filename}: {e}")
 
 
-    logger.info(f"脚本生成完成。共处理 {len(testcases)} 个用例，成功生成 {successful_scripts} 个脚本。")
+    logger.info(f"脚本生成完成。总计 {len(test_cases)} 个测试用例，成功生成 {successful_scripts} 个脚本。")
 
     if successful_scripts == 0:
         logger.error("未成功生成任何Playwright脚本，停止后续流程。")
-        exit(1)
-    else:
-        exit(0)
+        sys.exit(1) # Exit with a non-zero status code if no scripts were generated
