@@ -55,27 +55,36 @@ pipeline {
                 bat 'allure generate --clean allure-results'
             }
         }
+         // 添加一个阶段来发布 Allure 报告，这通常在 post 阶段之前
+         // 或者您可以在 post 阶段使用 allure 插件提供的步骤
+         stage('Publish Allure Report') {
+             steps {
+                 script {
+                     // 使用 Allure 插件提供的步骤发布报告
+                     // 确保您已经在 Jenkins Job 配置中启用了 Allure Report
+                     // 这里是一个示例，实际使用时请参照 Allure 插件文档
+                     try {
+                        allure([includeProperties: false, reportBuildFailure: true, reportDir: 'allure-report'])
+                         echo 'Allure report published.'
+                     } catch (Exception e) {
+                         echo "Failed to publish Allure report: ${e}"
+                     }
+
+                 }
+             }
+         }
     }
 
     post {
         always {
-            steps {
-                // 总是执行的清理或其他操作
-                // 可以添加 Allure 报告发布的 post 阶段在这里
-                // 例如:
-                // allure([includeProperties: false, reportBuildFailure: true, reportDir: 'allure-report'])
-                 echo 'Pipeline always block executed.' // 示例步骤
-            }
+            // 总是执行的清理或其他操作
+            echo 'Pipeline always block executed.' // 示例步骤
         }
         success {
-            steps {
-                echo 'Pipeline succeeded!'
-            }
+            echo 'Pipeline succeeded!'
         }
         failure {
-            steps {
-                echo 'Pipeline failed!'
-            }
+            echo 'Pipeline failed!'
         }
     }
 }
