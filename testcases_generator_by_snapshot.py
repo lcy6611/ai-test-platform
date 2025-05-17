@@ -47,7 +47,8 @@ def generate_testcases_by_snapshot(snapshots):
         )
         response.raise_for_status()
         resp_json = response.json()
-        if "choices" not in resp_json:
+        logging.info(f"AI原始返回: {resp_json}")
+        if "choices" not in resp_json or not resp_json["choices"]:
             logging.error(f"AI返回内容异常: {resp_json}")
             return ""
         content = resp_json["choices"][0]["message"]["content"]
@@ -64,6 +65,9 @@ if __name__ == "__main__":
     testcases = generate_testcases_by_snapshot(snapshots)
     if not testcases:
         logging.error("未生成任何用例，流程终止。")
+        # 生成一个空文件，防止后续脚本报错
+        with open("testcases.json", "w", encoding="utf-8") as f:
+            f.write("")
         exit(1)
     with open("testcases.json", "w", encoding="utf-8") as f:
         f.write(testcases)
