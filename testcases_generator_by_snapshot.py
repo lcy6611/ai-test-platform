@@ -24,32 +24,27 @@ def read_snapshots():
 
 def clean_code_block(text):
     text = text.strip()
-    if text.startswith("```"):
+    if text.startswith("```") or text.startswith("'''"):
         text = text.split('\n', 1)[-1]
-        if text.endswith("```"):
-            text = text.rsplit('\n', 1)[0]
-    if text.startswith("'''"):
-        text = text.split('\n', 1)[-1]
-        if text.endswith("'''"):
-            text = text.rsplit('\n', 1)[0]
+    if text.endswith("```") or text.endswith("'''"):
+        text = text.rsplit('\n', 1)[0]
     return text.strip()
 
 def generate_testcases_by_snapshot(snapshots):
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
     prompt = (
         "请根据以下页面快照，自动分析页面结构和功能，生成结构化的功能测试用例，"
         "每个用例包含scene, steps, expected三个字段，输出为JSON数组：\n"
         f"{snapshots}"
     )
-    data = {
-        "model": "deepseek-chat",
-        "messages": [{"role": "user", "content": prompt}]
-    }
+    data = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}]}
     try:
-        response = requests.post(DEEPSEEK_API_URL, headers=headers, json=data, timeout=120)
+        response = requests.post(
+            DEEPSEEK_API_URL, headers=headers, json=data, timeout=120
+        )
         response.raise_for_status()
         resp_json = response.json()
         if "choices" not in resp_json:
@@ -64,16 +59,11 @@ def generate_testcases_by_snapshot(snapshots):
 if __name__ == "__main__":
     snapshots = read_snapshots()
     if not snapshots:
-        logging.error("未读取到任何快照，程序退出。")
+        logging.error("未获取到任何页面快照，流程终止。")
         exit(1)
     testcases = generate_testcases_by_snapshot(snapshots)
-    testcases = clean_code_block(testcases)
-    try:
-        testcases_obj = json.loads(testcases)
-        with open("testcases.json", "w", encoding="utf-8") as f:
-            json.dump(testcases_obj, f, ensure_ascii=False, indent=2)
-        logging.info("测试用例已保存到 testcases.json")
-    except Exception as e:
-        logging.error(f"AI返回内容不是严格JSON，原始内容已保存: {e}")
-        with open("testcases_raw.txt", "w", encoding="utf-8") as f:
-            f.write(testcases)
+    if not testcases:
+        logging.error("未生成任何用例，流程终止。")
+        exit(1)
+    with open("testcases.json", "w", encoding="utf-8") as f:
+        f.write(testcases)

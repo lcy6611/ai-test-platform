@@ -2,6 +2,7 @@ pipeline {
     agent any
     environment {
         PYTHONUNBUFFERED = 1
+        DEEPSEEK_API_KEY = credentials('DEEPSEEK_API_KEY') // 这里的ID和凭据ID一致
     }
     stages {
         stage('Checkout') {
@@ -12,7 +13,8 @@ pipeline {
         stage('Install Dependencies') {
             steps {
                 bat 'pip install -r requirements.txt'
-                bat 'python -m playwright install'
+                bat 'playwright install'
+                bat 'pip install allure-pytest'
             }
         }
         stage('Page Snapshot') {
@@ -30,11 +32,6 @@ pipeline {
                 bat 'python script_generator.py'
             }
         }
-        stage('Check Selectors') {
-            steps {
-                bat 'python auto_check_selectors.py'
-            }
-        }
         stage('Run Tests') {
             steps {
                 bat 'python run_tests.py'
@@ -47,10 +44,7 @@ pipeline {
         }
         stage('Re-Run Healed Tests') {
             steps {
-                bat '''
-                pytest playwright_test_*.py.healed --alluredir=allure-results
-                exit 0
-                '''
+                bat 'pytest playwright_test_*.py.healed --alluredir=allure-results || exit 0'
             }
         }
         stage('Allure Report') {

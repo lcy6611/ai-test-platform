@@ -3,20 +3,22 @@ import json
 import os
 import re
 
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "sk-xxx")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 
-def read_snapshots():
-    if not os.path.exists("snapshots"):
-        return ""
-    snapshots = []
-    for fname in os.listdir("snapshots"):
-        if fname.endswith(".html"):
-            with open(os.path.join("snapshots", fname), "r", encoding="utf-8") as f:
-                snapshots.append(f"页面 {fname} 快照:\n{f.read()}")
-    return "\n".join(snapshots)
+def clean_code_block(text):
+    text = text.strip()
+    if text.startswith("```") or text.startswith("'''"):
+        text = text.split('\n', 1)[-1]
+    if text.endswith("```") or text.endswith("'''"):
+        text = text.rsplit('\n', 1)[0]
+    return text.strip()
 
-def generate_playwright_script(test_case, snapshots):
+def remove_invalid_asserts(code):
+    # 去除 assert False 这类无效断言
+    return re.sub(r'^\s*assert\s+False.*$', '', code, flags=re.MULTILINE)
+
+def generate_playwright_script(test_case):
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json"
@@ -27,54 +29,30 @@ def generate_playwright_script(test_case, snapshots):
         "所有中文注释都用三引号风格，不要用#，"
         "测试函数不要带任何参数，统一用with sync_playwright() as p:方式启动Playwright。"
         "不要生成 assert False 这种占位断言，遇到无法实现的断言请用 pass 占位。"
-        "所有控件操作前必须先click再fill。"
-        "请严格根据以下页面快照/HTML结构生成Playwright选择器，优先使用id、name、data-testid等唯一属性，不要凭空猜测class或结构。"
         "不要用本地文件路径如login_form.html或file:///path/to/login_form.html，"
         "请统一用实际可访问的URL（如 http://10.0.62.222:30050/ ），"
-        "脚本整体风格规范。\n"
-        f"页面快照如下：\n{snapshots}\n"
-        f"测试用例如下：\n{test_case}"
+        "脚本整体风格规范。"
+        f"\n{test_case}"
     )
-    data = {
-        "model": "deepseek-chat",
-        "messages": [{"role": "user", "content": prompt}]
-    }
+    data = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}]}
     response = requests.post(DEEPSEEK_API_URL, headers=headers, json=data)
-    return response.json()["choices"][0]["message"]["content"]
-
-def clean_code_block(text):
-    text = text.strip()
-    if text.startswith("```python"):
-        text = text[9:]
-    elif text.startswith("```"):
-        text = text[3:]
-    if text.strip().endswith("```"):
-        text = text.strip()[:-3]
-    return text.strip()
-
-def remove_invalid_asserts(script: str) -> str:
-    script = re.sub(r'^\s*assert\s+False.*$', '', script, flags=re.MULTILINE)
-    return script
-
-def ensure_imports(script: str) -> str:
-    imports = "from playwright.sync_api import sync_playwright, expect\nimport time\n"
-    if "from playwright.sync_api import sync_playwright" not in script:
-        script = imports + script
-    return script
+    code = response.json()["choices"][0]["message"]["content"]
+    code = clean_code_block(code)
+    code = remove_invalid_asserts(code)
+    return code
 
 if __name__ == "__main__":
-    for fname in os.listdir('.'):
-        if fname.startswith("playwright_test_") and fname.endswith(".py"):
-            os.remove(fname)
+    if not os.path.exists("testcases.json"):
+        print("testcases.json 不存在，流程终止。")
+        exit(1)
     with open("testcases.json", "r", encoding="utf-8") as f:
-        test_cases = json.load(f)
-    snapshots = read_snapshots()
-    for idx, case in enumerate(test_cases):
-        script_filename = f"playwright_test_{idx+1}.py"
-        script = generate_playwright_script(json.dumps(case, ensure_ascii=False), snapshots)
-        script = clean_code_block(script)
-        script = remove_invalid_asserts(script)
-        script = ensure_imports(script)
-        with open(script_filename, "w", encoding="utf-8") as f:
-            f.write(script)
-        print(f"已生成脚本: {script_filename}")
+        try:
+            testcases = json.load(f)
+        except Exception as e:
+            print(f"testcases.json 解析失败: {e}")
+            exit(1)
+    for idx, testcase in enumerate(testcases):
+        code = generate_playwright_script(json.dumps(testcase, ensure_ascii=False, indent=2))
+        filename = f"playwright_test_{idx+1}.py"
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(code)
