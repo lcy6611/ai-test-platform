@@ -64,7 +64,11 @@ def clean_code_block(text):
     # This regex keeps printable ASCII characters, and common whitespace (\t, \n, \r, \f, \v)
     # It also allows some common non-ASCII characters that might be in comments/docstrings (e.g., Chinese characters)
     # A more aggressive removal might be needed if errors persist, potentially restricting to ASCII only
-    text = re.sub(r'[^\x20-\x7E\s\u4E00-\u9FFF]+', '', text) # Keep printable ASCII, whitespace, and common CJK range
+    # Let's refine this to be more aggressive if the issue persists
+    # For now, keep a balance to allow comments, but be strict on control characters
+    # Allow common printable ASCII, basic whitespace, and a reduced range for common multi-byte chars
+    text = re.sub(r'[^\x09\x0A\x0D\x20-\x7E\u4E00-\u9FFF]+', '', text)
+
 
     return text.strip()
 
@@ -116,41 +120,48 @@ def fix_empty_blocks(code):
 def ensure_imports_and_structure(code):
     """
     确保必要的import语句存在，并且Playwright结构正确 (with sync_playwright() as p:)
-    并确保pytest标记存在
+    强制将必要的导入语句放在脚本的最顶部。
     """
-    # Ensure necessary imports
-    required_imports = [
+    # Define required imports as a set for quick lookup
+    required_imports = {
         "from playwright.sync_api import sync_playwright",
         "import pytest",
-        "import time" # Often useful for waits
-    ]
-    existing_imports = []
-    code_lines = code.splitlines()
-    processed_code_lines = []
-    imports_added = False
+        "import time", # Often useful for waits
+        "from playwright.sync_api import expect" # Ensure expect is imported
+    }
 
-    for line in code_lines:
+    existing_imports = set()
+    other_lines = []
+
+    # Separate existing imports from other code
+    lines = code.splitlines()
+    for line in lines:
         stripped_line = line.strip()
         if stripped_line.startswith("import ") or stripped_line.startswith("from "):
-            existing_imports.append(stripped_line)
+            existing_imports.add(stripped_line)
         else:
-            # Add required imports before the first non-import line
-            if not imports_added:
-                for imp in required_imports:
-                    if imp not in existing_imports:
-                        processed_code_lines.append(imp)
-                imports_added = True
-            processed_code_lines.append(line)
+            other_lines.append(line)
 
-    # Ensure all required imports are at the beginning if the file was only imports
-    if not imports_added:
-         for imp in required_imports:
-            if imp not in existing_imports:
-                processed_code_lines.append(imp)
-         processed_code_lines.extend(code_lines)
+    # Construct the new code with required imports at the very top
+    new_lines = []
+    for imp in sorted(list(required_imports)): # Add required imports first (sorted for consistency)
+         if imp not in existing_imports:
+             new_lines.append(imp)
 
+    # Add any other existing imports that are not in the required set
+    # This handles cases where AI might import other useful modules
+    for imp in sorted(list(existing_imports - required_imports)):
+         new_lines.append(imp)
 
-    code = "\n".join(processed_code_lines)
+    # Add a newline after imports for separation, if there are imports and other code
+    if (required_imports or existing_imports) and other_lines:
+        new_lines.append("") # Add a blank line
+
+    # Add the rest of the code
+    new_lines.extend(other_lines)
+
+    code = "\n".join(new_lines)
+
 
     # Ensure pytest function naming convention
     # Find function definitions and rename if necessary to start with test_
@@ -164,20 +175,27 @@ def ensure_imports_and_structure(code):
             # Don't rename dunder methods or main execution block
             if not func_name.startswith("__") and not func_name == "main" and not func_name.startswith("test_"):
                 # Preserve leading whitespace
-                leading_whitespace = line[:line.find(func_name)]
-                new_line = line.replace(func_name, f"test_{func_name}", 1)
-                processed_lines.append(new_line)
-                logger.info(f"Renamed function '{func_name}' to 'test_{func_name}' to follow pytest convention.")
-                continue
+                # Find the exact start of the function name to replace
+                name_start_index = line.find(func_name)
+                if name_start_index != -1:
+                     new_line = line[:name_start_index] + f"test_{func_name}" + line[name_start_index + len(func_name):]
+                     processed_lines.append(new_line)
+                     logger.info(f"Renamed function '{func_name}' to 'test_{func_name}' to follow pytest convention.")
+                     continue
         processed_lines.append(line)
 
     code = "\n".join(processed_lines)
 
+
     # Basic check for playwright structure (can be enhanced)
     if "with sync_playwright() as p:" not in code:
-        logger.warning("Playwright structure 'with sync_playwright() as p:' not found. This may cause issues.")
-        # More sophisticated fix would involve wrapping the main logic, but that's complex.
-        # For now, just log a warning.
+        # This is a critical structural element for basic Playwright usage.
+        # If missing, the generated script is unlikely to work.
+        logger.error("Playwright structure 'with sync_playwright() as p:' not found. The script is likely invalid.")
+        # We might consider trying to wrap the code, but it's risky. For now,
+        # we'll rely on the AST validation and error reporting if this is missing.
+        pass # Continue to AST validation
+
 
     return code
 
@@ -237,15 +255,16 @@ def validate_python_code(code):
 def generate_playwright_script(test_case, page_snapshot_content):
     """
     根据测试用例和页面快照内容，调用AI生成Playwright脚本。
+    返回生成的代码、错误信息以及原始prompt和AI响应数据。
     """
     if not DEEPSEEK_API_KEY:
         logger.error("DEEPSEEK_API_KEY not set.")
-        return None, "DEEPSEEK_API_KEY not set."
+        return None, "DEEPSEEK_API_KEY not set.", None, None
 
     api_prompt_content = f"""
 请将以下测试用例和页面快照转换为Playwright+Python自动化测试脚本。
 脚本应遵循pytest框架，每个测试用例生成一个独立的测试函数，函数名以 `test_` 开头。
-确保必要的import语句和Playwright结构 (`with sync_playwright() as p:`) 完整且正确。
+确保必要的import语句（包括 sync_playwright, pytest, expect）和Playwright结构 (`with sync_playwright() as p:`) 完整且正确。
 不要在代码中包含 markdown 代码块标记（如 ```python 和 ```）。
 将测试步骤作为注释添加到脚本中。
 不要使用 `assert False` 这样的占位断言，如果某个步骤暂时无法实现，请使用 `pass` 占位。
@@ -283,17 +302,19 @@ def generate_playwright_script(test_case, page_snapshot_content):
 
         logger.info("AI original response received.")
         # Log snippet of AI response
+        ai_response_content = None
         if response_data and 'choices' in response_data and response_data['choices']:
              ai_response_content = response_data['choices'][0]['message']['content']
              logger.info(f"AI response content snippet: '{ai_response_content[:200]}...'")
         else:
             logger.warning("AI response format unexpected or empty.")
-            return None, "AI response format unexpected or empty."
+            # Return error message, None for code and raw data
+            return None, "AI response format unexpected or empty.", api_prompt_content, response_data
 
 
         # Extract and clean the code block
         # Pass the raw content to clean_code_block
-        raw_script_content = response_data['choices'][0]['message']['content']
+        raw_script_content = ai_response_content
         logger.info("AI original script content extracted.")
 
         cleaned_script_content = clean_code_block(raw_script_content)
@@ -304,6 +325,7 @@ def generate_playwright_script(test_case, page_snapshot_content):
         script_with_fixed_blocks = fix_empty_blocks(cleaned_script_content)
         logger.info("Fixed empty blocks (pass insertion).")
 
+        # Ensure imports are correctly placed at the top
         script_with_imports = ensure_imports_and_structure(script_with_fixed_blocks)
         logger.info("Ensured necessary imports and handled existing ones.")
 
@@ -315,21 +337,26 @@ def generate_playwright_script(test_case, page_snapshot_content):
 
         if is_valid:
             logger.info("Generated script is syntactically valid.")
-            return validated_code, None # Return valid code
+            # Return valid code, None for error, and raw data
+            return validated_code, None, api_prompt_content, response_data
         else:
             logger.error(f"Generated script is syntactically invalid after attempted fixes: {error_message}")
-            # Return None and the error message for invalid code
-            return None, error_message
+            # Return None for code, the error message, and raw data
+            return None, error_message, api_prompt_content, response_data
 
 
     except requests.exceptions.RequestException as e:
-        logger.error(f"Error calling DeepSeek API: {e}")
+        error_message = f"Error calling DeepSeek API: {e}"
+        logger.error(error_message)
         logger.error(traceback.format_exc()) # Log the full traceback
-        return None, f"Error calling DeepSeek API: {e}"
+        # Return None for code, error message, and None for raw data
+        return None, error_message, api_prompt_content, None
     except Exception as e:
-        logger.error(f"An unexpected error occurred during script generation: {e}")
+        error_message = f"An unexpected error occurred during script generation: {e}"
+        logger.error(error_message)
         logger.error(traceback.format_exc()) # Log the full traceback
-        return None, f"An unexpected error occurred during script generation: {e}"
+        # Return None for code, error message, and None for raw data
+        return None, error_message, api_prompt_content, None
 
 # --- Main Execution ---
 if __name__ == "__main__":
@@ -341,6 +368,7 @@ if __name__ == "__main__":
     if os.path.exists(output_dir):
         logger.info(f"Cleaning up old script and error files in {output_dir}...")
         for filename in os.listdir(output_dir):
+            # Clean up .py, .error.py, and .raw_response.json files
             if filename.endswith(".py") or filename.endswith(".error.py") or filename.endswith(".raw_response.json"):
                 try:
                     os.remove(os.path.join(output_dir, filename))
@@ -355,9 +383,9 @@ if __name__ == "__main__":
         logger.error(f"Error: {testcases_file} not found. Please run testcase_generator_by_snapshot.py first.")
         sys.exit(1) # Exit with a non-zero status code to indicate failure
 
+    page_snapshot_content = "No snapshot available."
     if not os.path.exists(snapshot_file):
          logger.warning(f"Warning: {snapshot_file} not found. Script generation may be less accurate.")
-         page_snapshot_content = "No snapshot available."
     else:
         try:
             with open(snapshot_file, 'r', encoding='utf-8') as f:
@@ -390,53 +418,66 @@ if __name__ == "__main__":
 
         logger.info(f"为用例 '{test_case.get('scene', f'用例 {i+1}')}' 生成脚本...")
 
-        # Call API to generate script and get raw response for logging
-        generated_code, error_message = generate_playwright_script(test_case, page_snapshot_content)
+        # Call API to generate script and get all relevant data
+        generated_code, error_message, api_prompt, raw_api_response_data = generate_playwright_script(test_case, page_snapshot_content)
 
-        # Save raw AI response for debugging, regardless of success
-        # Need to get the raw response content before cleaning
-        # This requires modifying generate_playwright_script to return raw content as well
-        # For now, I'll just save the final generated_code (or None) and error
+        # Save raw AI response and prompt for debugging
         try:
-             # Re-call API to get raw response just for saving, or modify the function above
-             # Modifying the function is better. Let's assume generate_playwright_script returns raw_response_data too
-             # For this iteration, let's just save the prompt sent and the final cleaned/validated code or error
+             raw_data_to_save = {
+                 "prompt": api_prompt,
+                 "raw_api_response": raw_api_response_data,
+                 "generated_code_before_validation": generated_code if error_message else None, # Save if there was an error during validation
+                 "final_validated_code": generated_code if not error_message else None,
+                 "error_message": error_message
+             }
              with open(raw_response_filename, 'w', encoding='utf-8') as f:
-                 # Save prompt and the result (or error)
-                 json.dump({"prompt": api_prompt_content, "generated_code": generated_code, "error": error_message}, f, indent=2, ensure_ascii=False)
-             logger.info(f"原始AI响应信息（或错误信息）已保存到文件: {raw_response_filename}")
+                 json.dump(raw_data_to_save, f, indent=2, ensure_ascii=False)
+             logger.info(f"原始AI响应信息、prompt和结果已保存到文件: {raw_response_filename}")
         except Exception as e:
              logger.warning(f"无法保存原始AI响应到文件 {raw_response_filename}: {e}")
 
 
-        if generated_code:
+        if generated_code and not error_message: # Only save if generation and validation were successful
             try:
                 with open(script_filename, 'w', encoding='utf-8') as f:
                     f.write(generated_code)
                 logger.info(f"成功为用例 '{test_case.get('scene', f'用例 {i+1}')}' 生成脚本: {script_filename}")
                 successful_scripts += 1
+                # If script generated successfully, ensure no old error file exists for this test
+                if os.path.exists(error_filename):
+                     try:
+                          os.remove(error_filename)
+                          logger.debug(f"Removed old error file for successful script: {error_filename}")
+                     except OSError as e:
+                          logger.warning(f"Error removing old error file {error_filename}: {e}")
+
             except Exception as e:
                 logger.error(f"无法写入脚本文件 {script_filename}: {e}")
                 # Save the generated_code (even if writing failed) to the error file for inspection
+                error_message_file = f"无法写入脚本文件: {e}"
                 try:
                      with open(error_filename, 'w', encoding='utf-8') as f:
                           f.write(f"写入文件失败: {e}\n\n")
                           f.write("--- 生成的代码 ---\n")
-                          f.write(generated_code)
+                          if generated_code:
+                              f.write(generated_code)
+                          else:
+                              f.write("None (generated_code was None)")
                      logger.info(f"写入失败的代码已保存到文件: {error_filename}")
                 except Exception as write_error:
                      logger.error(f"无法保存写入失败的代码到文件 {error_filename}: {write_error}")
 
 
-        else:
+        else: # Script generation or validation failed
             logger.error(f"为用例 '{test_case.get('scene', f'用例 {i+1}')}' 生成脚本失败: {error_message}")
             # Save the error details and the problematic code (if any was returned before validation failed)
+            # The raw_response_filename already contains error info, but let's also save a simple .error.py
             try:
                 with open(error_filename, 'w', encoding='utf-8') as f:
-                    f.write(f"脚本生成失败，错误信息: {error_message}\n\n")
-                    # generated_code might be None if validation failed early
+                    f.write(f"脚本生成或验证失败，错误信息: {error_message}\n\n")
+                    # generated_code might be None if validation failed early, or if generation failed
                     if generated_code is not None:
-                         f.write("--- 可能有问题的代码 ---\n")
+                         f.write("--- 可能有问题的代码 (验证前的) ---\n")
                          f.write(generated_code)
                     else:
                         f.write("--- 未生成有效代码 ---\n")
