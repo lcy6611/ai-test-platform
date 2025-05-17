@@ -24,8 +24,11 @@ def read_snapshots():
 
 def clean_code_block(text):
     text = text.strip()
+    # 去除三重反引号和三重单引号包裹
     if text.startswith("```") or text.startswith("'''"):
-        text = text.split('\n', 1)[-1]
+        first_newline = text.find('\n')
+        if first_newline != -1:
+            text = text[first_newline+1:]
     if text.endswith("```") or text.endswith("'''"):
         text = text.rsplit('\n', 1)[0]
     return text.strip()
@@ -65,7 +68,14 @@ if __name__ == "__main__":
     testcases = generate_testcases_by_snapshot(snapshots)
     if not testcases:
         logging.error("未生成任何用例，流程终止。")
-        # 生成一个空文件，防止后续脚本报错
+        with open("testcases.json", "w", encoding="utf-8") as f:
+            f.write("")
+        exit(1)
+    # 写入前先校验JSON
+    try:
+        json.loads(testcases)
+    except Exception as e:
+        logging.error(f'AI返回内容不是合法JSON: {e}\n内容如下：\n{testcases}')
         with open("testcases.json", "w", encoding="utf-8") as f:
             f.write("")
         exit(1)
