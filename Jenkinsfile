@@ -1,104 +1,76 @@
 pipeline {
-    agent any
+    agent any // 或者指定具体的 Windows 节点
+
     environment {
-        PYTHONUNBUFFERED = 1
-        # Jenkins凭据ID需一致，确保在Jenkins中配置Secret Text类型的凭据，ID为 DEEPSEEK_API_KEY
+        // 从 Jenkins 凭据中注入 Secret Text 类型的 DEEPSEEK_API_KEY
+        // 确保在 Jenkins 中创建了一个 Secret Text 凭据，ID 必须是 DEEPSEEK_API_KEY
         DEEPSEEK_API_KEY = credentials('DEEPSEEK_API_KEY')
-        # 可选：设置测试环境URL环境变量，在脚本中使用 os.getenv('TEST_URL') 获取
-        # TEST_URL = 'http://10.0.62.222:30050/'
     }
+
     stages {
         stage('Checkout') {
             steps {
-                checkout scm
+                // 假设您的代码仓库是 git，并且已经配置在 Jenkins Pipeline 的 SCM 中
+                // 如果没有配置，需要在这里添加 checkout scm
+                 checkout scm
             }
         }
+
         stage('Install Dependencies') {
             steps {
-                echo 'Installing Python dependencies from requirements.txt...'
+                // 在 Windows 环境下使用 bat 命令
                 bat 'pip install -r requirements.txt'
-                echo 'Installing Playwright browsers...'
-                bat 'playwright install'
-                echo 'Installing allure-pytest...'
-                bat 'pip install allure-pytest'
             }
         }
-        stage('Page Snapshot') {
-            steps {
-                echo 'Collecting page snapshots...'
-                bat 'python page_snapshot_collector.py'
-            }
-        }
+
         stage('Generate Test Cases') {
             steps {
-                echo 'Generating test cases from snapshots using AI...'
+                // 在 Windows 环境下使用 bat 命令运行 Python 脚本
+                // DEEPSEEK_API_KEY 环境变量会自动注入到这个阶段
                 bat 'python testcases_generator_by_snapshot.py'
             }
         }
+
         stage('Generate Scripts') {
             steps {
-                echo 'Generating Playwright scripts from test cases using AI...'
+                // 在 Windows 环境下使用 bat 命令运行 Python 脚本
                 bat 'python script_generator.py'
             }
         }
+
         stage('Run Tests') {
             steps {
-                echo 'Running generated tests with pytest...'
-                # 使用 || true 或者 || exit 0 确保即使测试失败Jenkins阶段也标记为不稳定而不是失败，以便进入后续自愈阶段
-                # run_tests.py 脚本内部会根据pytest退出码生成 pytest_errors.log
-                bat 'python run_tests.py || exit 0' # 如果测试失败，run_tests.py会返回非零退出码，此处允许Jenkins阶段继续
+                // 在 Windows 环境下使用 bat 命令运行 pytest
+                // --alluredir=allure-results 参数用于生成 Allure 报告数据
+                bat 'pytest --alluredir=allure-results'
             }
         }
-        stage('Auto Heal') {
-             steps {
-                 echo 'Checking for failed tests and triggering auto-healing...'
-                 # auto_heal.py 会检查 pytest_errors.log 并尝试自愈失败脚本
-                 bat 'python auto_heal.py || exit 0' # 自愈失败不中断流程
-             }
-        }
-        stage('Re-Run Healed Tests') {
+
+        stage('Generate Allure Report') {
             steps {
-                echo 'Re-running healed tests...'
-                # 仅运行 .healed 脚本，失败也允许继续，避免因少数自愈失败的脚本导致整个流水线中断
-                bat 'pytest playwright_test_*.py.healed --alluredir=allure-results || exit 0'
-            }
-        }
-        stage('Allure Report') {
-            steps {
-                echo 'Generating Allure report...'
-                # Requires Allure Jenkins plugin and Allure Commandline tool installed and configured globally
-                # 在Jenkins全局工具配置中设置Allure Commandline
-                # 请确保安装 Allure Jenkins Plugin (https://plugins.jenkins.io/allure-jenkins-plugin/)
-                # 和 Allure Commandline Tool (在Jenkins全局工具配置中设置下载或指定路径)
-                script {
-                    try {
-                         allure includeProperties: false, jdk: '', results: [[path: 'allure-results']]
-                         echo 'Allure report generated.'
-                    } catch (Exception e) {
-                         echo "WARNING: Could not generate Allure report. Please ensure Allure plugin is installed and configured globally. Error: ${e}"
-                         // Optional: archive report directory manually if allure step fails
-                         // archiveArtifacts artifacts: 'allure-results/**', allowEmptyArchive: true
-                    }
-                }
+                // 生成 Allure 报告
+                // 确保 Jenkins 环境已经安装并配置了 Allure Commandline Tool
+                // 'allure' 命令可能需要配置到系统 PATH 或在 Jenkins 的全局工具配置中设置
+                // 如果 'allure' 命令找不到，请检查您的 Jenkins 系统配置
+                bat 'allure generate --clean allure-results'
+                // 您可能需要一个 post 阶段来发布 Allure 报告，这里只是生成
+                // 例如: allure([includeProperties: false, reportBuildFailure: true, reportDir: 'allure-report'])
             }
         }
     }
+
     post {
         always {
-            echo 'Archiving artifacts...'
-            # 归档自愈脚本、备份脚本、错误日志和Allure报告目录
-            archiveArtifacts artifacts: '**/*.healed, **/*.bak, pytest_errors.log, allure-results/**', allowEmptyArchive: true
-            echo 'Artifacts archived.'
+            // 总是执行的清理或其他操作
+            // 可以添加 Allure 报告发布的 post 阶段在这里
+            // 例如:
+            // allure([includeProperties: false, reportBuildFailure: true, reportDir: 'allure-report'])
         }
-        # 根据测试结果设置Jenkins构建状态
-        # failure { echo 'Build failed because tests failed.' } # Run Tests 阶段已用 || exit 0 防止构建失败，可以在这里根据需要调整
-        # unstable { echo 'Build unstable because some tests failed.' }
-        success { echo 'Build successful.' }
-        unstable { echo 'Build unstable (some tests failed or self-healed).' }
+        success {
+            echo 'Pipeline succeeded!'
+        }
         failure {
-            echo 'Build failed (critical error or all tests failed). Check logs.'
-            # 可以选择发送失败通知邮件等
-            # emailext body: "Pipeline ${currentBuild.fullDisplayName} failed.", subject: "Jenkins Build Failed", to: "your-email@example.com"
+            echo 'Pipeline failed!'
         }
     }
 }
