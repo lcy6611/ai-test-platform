@@ -11,13 +11,13 @@ from loguru import logger
 # 配置日志
 logger.add("file_{time}.log", rotation="1 day", level="INFO")
 
-def collect_snapshots(urls, output_dir="."):
+def collect_snapshots(urls, output_dir="snapshots"):
     """
     访问指定的 URLs，收集页面快照（UI元素信息），并保存到指定目录。
 
     Args:
         urls (list): 需要访问的 URL 列表。
-        output_dir (str): 快照文件保存的目录。默认为当前目录。
+        output_dir (str): 快照文件保存的目录。默认为 "snapshots"。
     """
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
@@ -39,41 +39,53 @@ def collect_snapshots(urls, output_dir="."):
                 # 更改等待状态为 "load"，通常比 "networkidle" 更可靠
                 page.wait_for_load_state("load", timeout=60000) # 增加等待加载超时
 
-                # --- 登录逻辑示例 (如果需要，请替换为实际登录步骤) ---
+                # --- 登录逻辑示例 (如果需要，请替换为实际登录步骤和选择器) ---
                 # 假设第一个URL是登录页，并且只需要收集登录后的页面快照
                 if "login" in url.lower(): # 示例：如果URL包含"login"
                     logger.info("Performing login...")
                     try:
-                        # 假设用户名和密码输入框以及登录按钮有特定的选择器
-                        # 请替换为实际的选择器
-                        username_field = page.locator('input[name="username"]')
-                        password_field = page.locator('input[name="password"]')
-                        login_button = page.locator('button[type="submit"]') # 或其他登录按钮选择器
+                        # !!! IMPORTANT: Replace with actual selectors for your login page !!!
+                        # 替换这里的选择器为你找到的准确选择器
+                        username_field_selector = 'input[name="username"]' # <-- REPLACE THIS
+                        password_field_selector = 'input[name="password"]' # <-- REPLACE THIS
+                        login_button_selector = 'button[type="submit"]'   # <-- REPLACE THIS
 
-                        # 确保点击后填写 (用户需求)
+                        username_field = page.locator(username_field_selector)
+                        password_field = page.locator(password_field_selector)
+                        login_button = page.locator(login_button_selector)
+
+                        # !!! IMPORTANT: Replace with actual username and password !!!
+                        actual_username = "your_username" # <-- REPLACE THIS
+                        actual_password = "your_password" # <-- REPLACE THIS
+
                         if username_field.count() > 0:
+                            logger.info(f"Found username field with selector: {username_field_selector}")
                             username_field.click(timeout=10000) # 增加点击超时
-                            username_field.fill("your_username", timeout=10000) # 替换为实际用户名，增加填写超时
+                            username_field.fill(actual_username, timeout=10000) # 增加填写超时
                         else:
-                            logger.warning("未找到用户名输入框")
+                            logger.warning(f"未找到用户名输入框，选择器: {username_field_selector}")
 
                         if password_field.count() > 0:
+                             logger.info(f"Found password field with selector: {password_field_selector}")
                              password_field.click(timeout=10000) # 增加点击超时
-                             password_field.fill("your_password", timeout=10000) # 替换为实际密码，增加填写超时
+                             password_field.fill(actual_password, timeout=10000) # 增加填写超时
                         else:
-                            logger.warning("未找到密码输入框")
+                            logger.warning(f"未找到密码输入框，选择器: {password_field_selector}")
 
                         if login_button.count() > 0:
+                             logger.info(f"Found login button with selector: {login_button_selector}")
                              login_button.click(timeout=30000) # 增加登录按钮点击超时
+                             # !!! IMPORTANT: Replace with the actual URL pattern after successful login !!!
                              # 等待登录后的页面加载，替换为实际的登录成功后的URL或元素
-                             page.wait_for_url("**/dashboard", timeout=60000) # 替换为实际的登录成功后URL
+                             page.wait_for_url("**/dashboard", timeout=60000) # <-- REPLACE THIS URL PATTERN
                              logger.info("Login successful.")
                         else:
-                            logger.warning("未找到登录按钮")
+                            logger.warning(f"未找到登录按钮，选择器: {login_button_selector}")
 
                     except Exception as e:
                         logger.error(f"登录过程中发生错误: {e}")
                         # 如果登录失败，可以选择跳过当前URL或处理
+                        continue # 如果登录失败，跳过当前页面的快照收集
 
                 # --- 结束登录逻辑示例 ---
 
@@ -85,7 +97,7 @@ def collect_snapshots(urls, output_dir="."):
                 current_page_elements = []
                 all_elements = elements_to_capture.all()
 
-                logger.info(f"正在收集页面 {url} 的 UI 元素...")
+                logger.info(f"正在收集页面 {page.url} 的 UI 元素...") # 记录当前页面的URL
                 for i, element in enumerate(all_elements):
                      try:
                          # 尝试获取元素的可见文本或value
@@ -105,7 +117,9 @@ def collect_snapshots(urls, output_dir="."):
                          if element.is_visible():
                              element_info = {
                                  "tag": tag_name,
-                                 "selector": f"css={elements_to_capture_selectors} >> nth={i}", # 使用 nth 伪类作为示例选择器
+                                 # 使用 Playwright 的 auto-generating selector 可能是更好的选择，或者构建更稳健的选择器
+                                 # 这里的 nth 伪类仅作为示例
+                                 "selector": f"css={elements_to_capture_selectors} >> nth={i}",
                                  "text": text_content,
                                  "name": name,
                                  "id": id_attr,
@@ -119,16 +133,18 @@ def collect_snapshots(urls, output_dir="."):
                              # logger.debug(f"Captured element: {element_info}") # 调试信息
 
                      except Exception as e:
-                         logger.warning(f"收集页面 {url} 第 {i} 个元素时发生错误: {e}")
+                         logger.warning(f"收集页面 {page.url} 第 {i} 个元素时发生错误: {e}")
                          continue # 继续收集下一个元素
 
-                all_snapshots_data[url] = current_page_elements
-                logger.info(f"页面 {url} 的 UI 元素收集完成，共收集 {len(current_page_elements)} 个元素。")
+                # 使用当前页面的最终 URL 作为键
+                all_snapshots_data[page.url] = current_page_elements
+                logger.info(f"页面 {page.url} 的 UI 元素收集完成，共收集 {len(current_page_elements)} 个元素。")
 
 
             except Exception as e:
                 logger.error(f"访问或处理页面 {url} 时发生错误: {e}")
                 # 如果某个URL处理失败，记录错误并继续处理下一个URL
+                all_snapshots_data[url] = {"error": str(e)} # 记录错误信息到快照数据中
 
         # 将收集到的所有快照数据保存到 JSON 文件
         try:
@@ -144,7 +160,8 @@ def collect_snapshots(urls, output_dir="."):
 
 if __name__ == "__main__":
     # 示例使用，替换为您的目标应用URL
-    target_urls = ["http://10.0.62.222:30050/login"] # 替换为实际需要收集快照的URL列表
+    # 如果需要收集登录后的页面，请将登录页URL放在列表的第一个
+    target_urls = ["http://10.0.62.222:30050/login"] # <-- REPLACE WITH YOUR TARGET URL(S)
     output_directory = "snapshots" # 快照文件保存的目录
 
     logger.info(f"开始收集页面快照到目录: {output_directory}")
