@@ -68,52 +68,54 @@ def collect_snapshots(urls, output_dir="snapshots"):
                         actual_username = "YOUR_USERNAME" # <-- REPLACE THIS with your username
                         actual_password = "YOUR_PASSWORD" # <-- REPLACE THIS with your password
 
-                        logger.info(f"Checking username field with selector: {username_field_selector}")
-                        if username_field.count() > 0 and username_field.is_visible(): # 检查元素是否存在且可见
-                            logger.info(f"Found and visible username field with selector: {username_field_selector}")
+                        logger.info(f"Waiting for username field with selector: {username_field_selector}")
+                        try:
+                            username_field.wait_for(state='visible', timeout=15000) # 显式等待用户名输入框可见
+                            logger.info("Username field is visible.")
                             username_field.click(timeout=10000) # 增加点击超时
                             username_field.fill(actual_username, timeout=10000) # 增加填写超时
-                        else:
-                            logger.warning(f"未找到或不可见用户名输入框，选择器: {username_field_selector}")
-                            # 如果关键元素未找到或不可见，可能需要更强的错误处理或跳过
-                            # continue # uncomment to skip if username field is not found
+                        except Exception as e:
+                            logger.warning(f"等待或操作用户名输入框失败，选择器: {username_field_selector}, 错误: {e}")
+                            # continue # uncomment to skip if username field cannot be interacted with
 
 
-                        logger.info(f"Checking password field with selector: {password_field_selector}")
-                        if password_field.count() > 0 and password_field.is_visible(): # 检查元素是否存在且可见
-                             logger.info(f"Found and visible password field with selector: {password_field_selector}")
-                             password_field.click(timeout=10000) # 增加点击超时
-                             password_field.fill(actual_password, timeout=10000) # 增加填写超时
-                        else:
-                            logger.warning(f"未找到或不可见密码输入框，选择器: {password_field_selector}")
-                            # continue # uncomment to skip if password field is not found
+                        logger.info(f"Waiting for password field with selector: {password_field_selector}")
+                        try:
+                            password_field.wait_for(state='visible', timeout=15000) # 显式等待密码输入框可见
+                            logger.info("Password field is visible.")
+                            password_field.click(timeout=10000) # 增加点击超时
+                            password_field.fill(actual_password, timeout=10000) # 增加填写超时
+                        except Exception as e:
+                            logger.warning(f"等待或操作密码输入框失败，选择器: {password_field_selector}, 错误: {e}")
+                            # continue # uncomment to skip if password field cannot be interacted with
 
 
-                        logger.info(f"Checking login button with selector: {login_button_selector}")
-                        if login_button.count() > 0 and login_button.is_visible(): # 检查元素是否存在且可见
-                             logger.info(f"Found and visible login button with selector: {login_button_selector}")
-                             login_button.click(timeout=30000) # 增加登录按钮点击超时
-                             # !!! IMPORTANT: Replace with the actual URL pattern after successful login !!!
-                             # 等待登录后的页面加载，替换为实际的登录成功后的URL或元素
-                             # 例如: page.wait_for_url("**/dashboard", timeout=60000)
-                             # 或者等待登录后页面的某个特有元素出现: page.wait_for_selector("selector_on_dashboard", timeout=60000)
-                             logger.info("Waiting for post-login page...")
-                             # 请根据实际登录成功后的页面URL或元素来替换下面的等待逻辑
-                             # page.wait_for_url("**/dashboard", timeout=60000) # 示例等待URL
-                             # 或者
-                             # page.wait_for_selector("div.main-dashboard", timeout=60000) # 示例等待元素
+                        logger.info(f"Waiting for login button with selector: {login_button_selector}")
+                        try:
+                            login_button.wait_for(state='visible', timeout=15000) # 显式等待登录按钮可见
+                            logger.info("Login button is visible.")
+                            login_button.click(timeout=30000) # 增加登录按钮点击超时
+                            # !!! IMPORTANT: Replace with the actual URL pattern after successful login !!!
+                            # 等待登录后的页面加载，替换为实际的登录成功后的URL或元素
+                            # 例如: page.wait_for_url("**/dashboard", timeout=60000)
+                            # 或者等待登录后页面的某个特有元素出现: page.wait_for_selector("selector_on_dashboard", timeout=60000)
+                            logger.info("Waiting for post-login page...")
+                            # 请根据实际登录成功后的页面URL或元素来替换下面的等待逻辑
+                            # page.wait_for_url("**/dashboard", timeout=60000) # 示例等待URL
+                            # 或者
+                            # page.wait_for_selector("div.main-dashboard", timeout=60000) # 示例等待元素
 
-                             # 临时添加一个等待超时作为示例，请用更可靠的等待方法替换
-                             page.wait_for_timeout(10000) # 示例：增加等待时间到10秒钟
-                             logger.info("Login action performed, proceeded to URL: {}".format(page.url))
+                            # 临时添加一个等待超时作为示例，请用更可靠的等待方法替换
+                            page.wait_for_timeout(15000) # 示例：增加等待时间到15秒钟
+                            logger.info("Login action performed, proceeded to URL: {}".format(page.url))
 
+                        except Exception as e:
+                            logger.warning(f"等待或操作登录按钮失败，选择器: {login_button_selector}, 错误: {e}")
+                            # continue # uncomment to skip if login button cannot be interacted with
 
-                        else:
-                            logger.warning(f"未找到或不可见登录按钮，选择器: {login_button_selector}")
-                            # continue # uncomment to skip if login button is not found
 
                     except Exception as e:
-                        logger.error(f"登录过程中发生错误: {e}")
+                        logger.error(f"登录过程中发生未知错误: {e}")
                         # 如果登录失败，可以选择跳过当前URL或处理
                         continue # 如果登录失败，跳过当前页面的快照收集
 
@@ -133,34 +135,37 @@ def collect_snapshots(urls, output_dir="snapshots"):
                 elements_to_capture_selectors = 'input, button, a, select, textarea, [role="button"], [onclick]' # 添加更多可能代表交互元素的CSS选择器
                 elements_to_capture = page.locator(elements_to_capture_selectors)
                 current_page_elements = []
-                # 添加等待，确保元素有时间加载
+                # 添加等待，确保元素有时间加载并可见
                 try:
-                    elements_to_capture.first.wait_for(state='visible', timeout=10000) # 等待第一个匹配的元素可见
+                    # 等待至少一个交互元素可见，但如果页面为空，可能会超时
+                    elements_to_capture.first.wait_for(state='visible', timeout=15000) # 增加等待时间
                     logger.info("页面上的交互元素已加载并可见。")
                 except Exception as e:
-                    logger.warning(f"等待页面交互元素超时或失败: {e}. 尝试继续收集可见元素。")
+                    # 如果等待超时，可能是页面加载问题或没有匹配的元素
+                    logger.warning(f"等待页面交互元素超时或失败: {e}. 尝试继续收集可见元素（即使没有匹配的）。")
 
 
                 all_elements = elements_to_capture.all()
 
                 logger.info(f"正在收集页面 {page.url} 的 UI 元素...") # 记录当前页面的URL
+                collected_count = 0
                 for i, element in enumerate(all_elements):
                      try:
-                         # 尝试获取元素的可见文本或value
-                         text_content = element.text_content().strip() if element.text_content() else ""
-                         if not text_content and 'value' in element.evaluate('el => el.attributes').keys():
-                             text_content = element.get_attribute('value') or ""
-
-                         # 尝试获取元素的名称、ID、类型、角色等属性
-                         name = element.get_attribute('name')
-                         id_attr = element.get_attribute('id')
-                         type_attr = element.get_attribute('type')
-                         role_attr = element.get_attribute('role')
-                         # 获取元素的标签名
-                         tag_name = element.evaluate('el => el.tagName')
-
                          # 仅捕获可见元素
                          if element.is_visible():
+                             # 尝试获取元素的可见文本或value
+                             text_content = element.text_content().strip() if element.text_content() else ""
+                             if not text_content and 'value' in element.evaluate('el => el.attributes').keys():
+                                 text_content = element.get_attribute('value') or ""
+
+                             # 尝试获取元素的名称、ID、类型、角色等属性
+                             name = element.get_attribute('name')
+                             id_attr = element.get_attribute('id')
+                             type_attr = element.get_attribute('type')
+                             role_attr = element.get_attribute('role')
+                             # 获取元素的标签名
+                             tag_name = element.evaluate('el => el.tagName')
+
                              element_info = {
                                  "tag": tag_name,
                                  # 使用 Playwright 的 auto-generating selector 可能是更好的选择，或者构建更稳健的选择器
@@ -177,6 +182,7 @@ def collect_snapshots(urls, output_dir="snapshots"):
                                  # "href": element.get_attribute('href'),
                              }
                              current_page_elements.append(element_info)
+                             collected_count += 1
                              # logger.debug(f"Captured element: {element_info}") # 调试信息
 
                      except Exception as e:
@@ -185,7 +191,7 @@ def collect_snapshots(urls, output_dir="snapshots"):
 
                 # 使用当前页面的最终 URL 作为键
                 all_snapshots_data[page.url] = current_page_elements
-                logger.info(f"页面 {page.url} 的 UI 元素收集完成，共收集 {len(current_page_elements)} 个元素。")
+                logger.info(f"页面 {page.url} 的 UI 元素收集完成，共收集 {collected_count} 个可见元素。") # 记录实际收集到的可见元素数量
 
 
             except Exception as e:
