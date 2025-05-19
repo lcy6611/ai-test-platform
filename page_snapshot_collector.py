@@ -43,6 +43,16 @@ def collect_snapshots(urls, output_dir="snapshots"):
                 # 假设第一个URL是登录页，并且只需要收集登录后的页面快照
                 if "login" in url.lower(): # 示例：如果URL包含"login"
                     logger.info("Performing login...")
+
+                    # 在尝试登录操作前截取屏幕快照
+                    screenshot_path_before_login = os.path.join(output_dir, "login_page_before_action.png")
+                    try:
+                        page.screenshot(path=screenshot_path_before_login)
+                        logger.info(f"登录前页面快照已保存到: {screenshot_path_before_login}")
+                    except Exception as e:
+                         logger.warning(f"截取登录前快照失败: {e}")
+
+
                     try:
                         # !!! IMPORTANT: Replace with actual selectors for your login page !!!
                         # 替换这里的选择器为你找到的准确选择器
@@ -58,26 +68,30 @@ def collect_snapshots(urls, output_dir="snapshots"):
                         actual_username = "YOUR_USERNAME" # <-- REPLACE THIS with your username
                         actual_password = "YOUR_PASSWORD" # <-- REPLACE THIS with your password
 
-                        if username_field.count() > 0:
-                            logger.info(f"Found username field with selector: {username_field_selector}")
+                        logger.info(f"Checking username field with selector: {username_field_selector}")
+                        if username_field.count() > 0 and username_field.is_visible(): # 检查元素是否存在且可见
+                            logger.info(f"Found and visible username field with selector: {username_field_selector}")
                             username_field.click(timeout=10000) # 增加点击超时
                             username_field.fill(actual_username, timeout=10000) # 增加填写超时
                         else:
-                            logger.warning(f"未找到用户名输入框，选择器: {username_field_selector}")
-                            # 如果关键元素未找到，可能需要更强的错误处理或跳过
+                            logger.warning(f"未找到或不可见用户名输入框，选择器: {username_field_selector}")
+                            # 如果关键元素未找到或不可见，可能需要更强的错误处理或跳过
                             # continue # uncomment to skip if username field is not found
 
-                        if password_field.count() > 0:
-                             logger.info(f"Found password field with selector: {password_field_selector}")
+
+                        logger.info(f"Checking password field with selector: {password_field_selector}")
+                        if password_field.count() > 0 and password_field.is_visible(): # 检查元素是否存在且可见
+                             logger.info(f"Found and visible password field with selector: {password_field_selector}")
                              password_field.click(timeout=10000) # 增加点击超时
                              password_field.fill(actual_password, timeout=10000) # 增加填写超时
                         else:
-                            logger.warning(f"未找到密码输入框，选择器: {password_field_selector}")
+                            logger.warning(f"未找到或不可见密码输入框，选择器: {password_field_selector}")
                             # continue # uncomment to skip if password field is not found
 
 
-                        if login_button.count() > 0:
-                             logger.info(f"Found login button with selector: {login_button_selector}")
+                        logger.info(f"Checking login button with selector: {login_button_selector}")
+                        if login_button.count() > 0 and login_button.is_visible(): # 检查元素是否存在且可见
+                             logger.info(f"Found and visible login button with selector: {login_button_selector}")
                              login_button.click(timeout=30000) # 增加登录按钮点击超时
                              # !!! IMPORTANT: Replace with the actual URL pattern after successful login !!!
                              # 等待登录后的页面加载，替换为实际的登录成功后的URL或元素
@@ -90,18 +104,26 @@ def collect_snapshots(urls, output_dir="snapshots"):
                              # page.wait_for_selector("div.main-dashboard", timeout=60000) # 示例等待元素
 
                              # 临时添加一个等待超时作为示例，请用更可靠的等待方法替换
-                             page.wait_for_timeout(5000) # 示例：等待5秒钟
+                             page.wait_for_timeout(10000) # 示例：增加等待时间到10秒钟
                              logger.info("Login action performed, proceeded to URL: {}".format(page.url))
 
 
                         else:
-                            logger.warning(f"未找到登录按钮，选择器: {login_button_selector}")
+                            logger.warning(f"未找到或不可见登录按钮，选择器: {login_button_selector}")
                             # continue # uncomment to skip if login button is not found
 
                     except Exception as e:
                         logger.error(f"登录过程中发生错误: {e}")
                         # 如果登录失败，可以选择跳过当前URL或处理
                         continue # 如果登录失败，跳过当前页面的快照收集
+
+                    # 在登录尝试后截取屏幕快照
+                    screenshot_path_after_login = os.path.join(output_dir, "login_page_after_action.png")
+                    try:
+                         page.screenshot(path=screenshot_path_after_login)
+                         logger.info(f"登录后页面快照已保存到: {screenshot_path_after_login}")
+                    except Exception as e:
+                         logger.warning(f"截取登录后快照失败: {e}")
 
                 # --- 结束登录逻辑示例 ---
 
@@ -111,6 +133,14 @@ def collect_snapshots(urls, output_dir="snapshots"):
                 elements_to_capture_selectors = 'input, button, a, select, textarea, [role="button"], [onclick]' # 添加更多可能代表交互元素的CSS选择器
                 elements_to_capture = page.locator(elements_to_capture_selectors)
                 current_page_elements = []
+                # 添加等待，确保元素有时间加载
+                try:
+                    elements_to_capture.first.wait_for(state='visible', timeout=10000) # 等待第一个匹配的元素可见
+                    logger.info("页面上的交互元素已加载并可见。")
+                except Exception as e:
+                    logger.warning(f"等待页面交互元素超时或失败: {e}. 尝试继续收集可见元素。")
+
+
                 all_elements = elements_to_capture.all()
 
                 logger.info(f"正在收集页面 {page.url} 的 UI 元素...") # 记录当前页面的URL
@@ -135,6 +165,7 @@ def collect_snapshots(urls, output_dir="snapshots"):
                                  "tag": tag_name,
                                  # 使用 Playwright 的 auto-generating selector 可能是更好的选择，或者构建更稳健的选择器
                                  # 这里的 nth 伪类仅作为示例
+                                 # 考虑使用 element.locator('').evaluate() 获取更精确的选择器，但这会增加复杂性
                                  "selector": f"css={elements_to_capture_selectors} >> nth={i}",
                                  "text": text_content,
                                  "name": name,
