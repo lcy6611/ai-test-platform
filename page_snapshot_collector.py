@@ -39,24 +39,24 @@ def collect_snapshots(urls, output_dir="snapshots"):
                 # 更改等待状态为 "load"，通常比 "networkidle" 更可靠
                 page.wait_for_load_state("load", timeout=60000) # 增加等待加载超时
 
-                # --- 登录逻辑示例 (如果需要，请替换为实际登录步骤和选择器) ---
+                # --- 登录逻辑示例 (请替换为实际登录步骤和选择器) ---
                 # 假设第一个URL是登录页，并且只需要收集登录后的页面快照
                 if "login" in url.lower(): # 示例：如果URL包含"login"
                     logger.info("Performing login...")
                     try:
                         # !!! IMPORTANT: Replace with actual selectors for your login page !!!
                         # 替换这里的选择器为你找到的准确选择器
-                        username_field_selector = 'input[name="username"]' # <-- REPLACE THIS
-                        password_field_selector = 'input[name="password"]' # <-- REPLACE THIS
-                        login_button_selector = 'button[type="submit"]'   # <-- REPLACE THIS
+                        username_field_selector = '#form_item_username' # <-- 根据您提供的HTML确定的选择器
+                        password_field_selector = '#form_item_password' # <-- 根据您提供的HTML确定的选择器
+                        login_button_selector = 'text="登 录"'         # <-- 根据您提供的HTML确定的选择器
 
                         username_field = page.locator(username_field_selector)
                         password_field = page.locator(password_field_selector)
                         login_button = page.locator(login_button_selector)
 
                         # !!! IMPORTANT: Replace with actual username and password !!!
-                        actual_username = "your_username" # <-- REPLACE THIS
-                        actual_password = "your_password" # <-- REPLACE THIS
+                        actual_username = "YOUR_USERNAME" # <-- REPLACE THIS with your username
+                        actual_password = "YOUR_PASSWORD" # <-- REPLACE THIS with your password
 
                         if username_field.count() > 0:
                             logger.info(f"Found username field with selector: {username_field_selector}")
@@ -64,6 +64,8 @@ def collect_snapshots(urls, output_dir="snapshots"):
                             username_field.fill(actual_username, timeout=10000) # 增加填写超时
                         else:
                             logger.warning(f"未找到用户名输入框，选择器: {username_field_selector}")
+                            # 如果关键元素未找到，可能需要更强的错误处理或跳过
+                            # continue # uncomment to skip if username field is not found
 
                         if password_field.count() > 0:
                              logger.info(f"Found password field with selector: {password_field_selector}")
@@ -71,16 +73,30 @@ def collect_snapshots(urls, output_dir="snapshots"):
                              password_field.fill(actual_password, timeout=10000) # 增加填写超时
                         else:
                             logger.warning(f"未找到密码输入框，选择器: {password_field_selector}")
+                            # continue # uncomment to skip if password field is not found
+
 
                         if login_button.count() > 0:
                              logger.info(f"Found login button with selector: {login_button_selector}")
                              login_button.click(timeout=30000) # 增加登录按钮点击超时
                              # !!! IMPORTANT: Replace with the actual URL pattern after successful login !!!
                              # 等待登录后的页面加载，替换为实际的登录成功后的URL或元素
-                             page.wait_for_url("**/dashboard", timeout=60000) # <-- REPLACE THIS URL PATTERN
-                             logger.info("Login successful.")
+                             # 例如: page.wait_for_url("**/dashboard", timeout=60000)
+                             # 或者等待登录后页面的某个特有元素出现: page.wait_for_selector("selector_on_dashboard", timeout=60000)
+                             logger.info("Waiting for post-login page...")
+                             # 请根据实际登录成功后的页面URL或元素来替换下面的等待逻辑
+                             # page.wait_for_url("**/dashboard", timeout=60000) # 示例等待URL
+                             # 或者
+                             # page.wait_for_selector("div.main-dashboard", timeout=60000) # 示例等待元素
+
+                             # 临时添加一个等待超时作为示例，请用更可靠的等待方法替换
+                             page.wait_for_timeout(5000) # 示例：等待5秒钟
+                             logger.info("Login action performed, proceeded to URL: {}".format(page.url))
+
+
                         else:
                             logger.warning(f"未找到登录按钮，选择器: {login_button_selector}")
+                            # continue # uncomment to skip if login button is not found
 
                     except Exception as e:
                         logger.error(f"登录过程中发生错误: {e}")
