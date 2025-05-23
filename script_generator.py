@@ -6,7 +6,7 @@
 import json
 import os
 import re
-
+import subprocess  # Import subprocess for running autopep8
 import requests
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
@@ -119,3 +119,15 @@ if __name__ == "__main__":
         with open(filename, "w", encoding="utf-8") as f:
             f.write(code)
         print(f"已生成脚本: {filename}")
+
+        # 使用 autopep8 格式化生成的脚本
+        try:
+            import subprocess
+            subprocess.run(["autopep8", "--in-place", filename], check=True)
+            print(f"已格式化脚本: {filename}")
+        except FileNotFoundError:
+            print("警告: 未找到 autopep8 命令，请确保已安装 (pip install autopep8) 且在 PATH 中。")
+        except subprocess.CalledProcessError as e:
+            print(f"警告: autopep8 格式化脚本 {filename} 失败: {e}")
+        except Exception as e:
+            print(f"格式化脚本 {filename} 时发生意外错误: {e}")
