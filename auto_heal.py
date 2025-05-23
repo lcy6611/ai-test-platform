@@ -11,6 +11,7 @@ import subprocess
 import re # Import re module
 import ast # Import ast module
 import requests # Import requests module for AI API call
+import traceback # Import traceback module
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -51,6 +52,7 @@ def get_failed_tests_from_log(log_file="pytest_errors.log"):
 
     except Exception as e:
         logging.error(f"解析pytest错误日志失败: {e}")
+        logging.error(traceback.format_exc())
         return []
 
     logging.info(f"从日志中解析到以下失败/收集错误脚本: {list(failed_files)}")
@@ -89,6 +91,7 @@ def load_testcase_by_script_name(script_path, testcases_file="testcases.json"):
 
     except Exception as e:
         logging.error(f"根据脚本名查找测试用例失败 {script_name}: {e}")
+        logging.error(traceback.format_exc())
         return None
 
 
@@ -108,6 +111,7 @@ def heal_script(original_script_path, testcase, error_info):
             original_code = f.read()
     except Exception as e:
         logging.error(f"读取原始失败脚本失败 {original_script_path}: {e}")
+        logging.error(traceback.format_exc())
         return ""
 
     if not DEEPSEEK_API_KEY:
@@ -126,7 +130,7 @@ def heal_script(original_script_path, testcase, error_info):
         "--- 原始测试用例 ---\n```json\n{testcase_json}\n```\n"
         "--- 失败信息/错误日志 ---\n```\n{error_info}\n```\n"
         "--- 修复要求 ---\n"
-        "请提供完整的可运行脚本，包含所有必要的import（特别是 Playwright 相关、time, re, pytest）。\n"
+        "请提供完整的可运行脚本，包含所有必要的import（特别是 Playwright 相关、time, re, pytest, os, json, traceback, logging）。\n"
         "重点根据失败信息（IndentationError, NameError, Playwright Specific errors etc.）修复选择器、等待条件、断言或逻辑错误。\n"
         "保持原测试用例的场景和步骤意图。\n"
         "所有中文注释用三引号风格，不要用#。\n"
@@ -163,26 +167,53 @@ def heal_script(original_script_path, testcase, error_info):
         healed_code = fix_empty_blocks(healed_code) # 自愈后也可能带空块
         healed_code = ensure_imports(healed_code) # 确保导入
 
+        # 在 fill(), click(), type() 前添加等待可编辑/可用状态
+        lines = healed_code.splitlines()
+        processed_lines = []
+        for i, line in enumerate(lines):
+            stripped_line = line.strip()
+            # 简单的正则匹配 Playwright 交互操作
+            match_fill = re.match(r'^(.*\.)fill\((.*)\)$', stripped_line)
+            match_click = re.match(r'^(.*\.)click\((.*)\)$', stripped_line)
+            match_type = re.match(r'^(.*\.)type\\((.*)\\)$', stripped_line) # 修复了 type() 方法的正则
+
+            if match_fill or match_click or match_type:
+                locator_part = (match_fill or match_click or match_type).group(1)
+                # 插入等待可编辑的逻辑，保持原有缩进
+                indent = line[:len(line) - len(stripped_line)]
+                wait_line = f"{indent}{locator_part}.wait_for(state=\\'editable\\', timeout=10000)" # 10秒等待可编辑
+                processed_lines.append(wait_line)
+                processed_lines.append(line) # 添加原始操作行
+            else:
+                processed_lines.append(line) # 添加非操作行
+
+        healed_code = "\\n".join(processed_lines)
+
+
         # 最终语法检查
         if not is_valid_python(healed_code):
-             logging.warning("自愈后的代码存在语法问题，尝试兜底补全空块...")
-             # 再次尝试修复可能的空块导致的语法错误
-             healed_code = fix_empty_blocks(healed_code) # 再次运行 fix_empty_blocks
-             healed_code = ensure_imports(healed_code) # 再次确保导入
-             if not is_valid_python(healed_code):
-                  logging.error("自愈后的代码经过兜底修复后仍存在语法问题，放弃自愈。")
-                  # 将失败的脚本移回原位（从.bak恢复），并记录自愈失败标记
-                  try:
-                      os.rename(original_script_path + ".bak", original_script_path)
-                      logging.info(f"已将备份文件 {original_script_path + '.bak'} 恢复为 {original_script_path}")
-                      # 记录自愈失败标记，避免下次继续尝试自愈
-                      with open(original_script_path + ".heal_failed", "w") as f:
-                          f.write("Self-healing failed")
-                      logging.info(f"已为 {original_script_path} 创建自愈失败标记文件。")
+             logging.warning("自愈后的代码存在语法问题。")
+             # 将失败的脚本移回原位（从.bak恢复），并记录自愈失败标记
+             try:
+                 # Check if backup file exists before attempting to restore
+                 if os.path.exists(original_script_path + ".bak"):
+                     os.rename(original_script_path + ".bak", original_script_path)
+                     logging.info(f"已将备份文件 {original_script_path + '.bak'} 恢复为 {original_script_path}")
+                 else:
+                     logging.warning(f"未找到备份文件 {original_script_path + '.bak'}，无法恢复原始脚本。")
 
-                  except OSError as e:
-                      logging.error(f"恢复备份文件 {original_script_path + '.bak'} 失败: {e}")
-                  return "" # 返回空字符串表示自愈失败
+                 # 记录自愈失败标记，避免下次继续尝试自愈
+                 heal_failed_marker = original_script_path + ".heal_failed"
+                 with open(heal_failed_marker, "w") as f:
+                     f.write("Self-healing failed due to invalid Python syntax")
+                 logging.error(f"已为 {original_script_path} 创建自愈失败标记文件。")
+
+             except OSError as e:
+                 logging.error(f"处理自愈失败脚本 {original_script_path} 时发生OSError: {e}")
+             except Exception as e:
+                 logging.error(f"处理自愈失败脚本 {original_script_path} 时发生未知异常: {e}")
+
+             return "" # 返回空字符串表示自愈失败
 
 
         logging.info("自愈脚本后处理完成，语法检查通过。")
@@ -190,13 +221,31 @@ def heal_script(original_script_path, testcase, error_info):
 
     except requests.exceptions.RequestException as e:
         logging.error(f"调用 deepseek-chat API 自愈请求失败: {e}")
+        logging.error(traceback.format_exc())
         return ""
     except json.JSONDecodeError as e:
          logging.error(f"解析 deepseek-chat API 自愈返回的JSON失败: {e}")
+         logging.error(traceback.format_exc())
          return ""
     except Exception as e:
         logging.error(f"自愈脚本过程中发生未知错误: {e}")
-        return ""
+        logging.error(traceback.format_exc())
+        # 在发生意外错误时也恢复备份文件并标记自愈失败
+        try:
+            if os.path.exists(original_script_path + ".bak"):
+                os.rename(original_script_path + ".bak", original_script_path)
+                logging.info(f"已将备份文件 {original_script_path + '.bak'} 恢复为 {original_script_path}")
+            else:
+                logging.warning(f"未找到备份文件 {original_script_path + '.bak'}，无法恢复原始脚本。")
+
+            heal_failed_marker = original_script_path + ".heal_failed"
+            with open(heal_failed_marker, "w") as f:
+                f.write(f"Self-healing failed with exception: {e}")
+            logging.error(f"已为 {original_script_path} 创建自愈失败标记文件。")
+        except Exception as cleanup_e:
+            logging.error(f"自愈失败清理过程中发生错误: {cleanup_e}")
+
+        return "" # 返回空字符串表示自愈失败
 
 def is_valid_python(code):
     """
@@ -207,12 +256,13 @@ def is_valid_python(code):
         ast.parse(code)
         return True
     except Exception as e:
-        # 记录详细的语法错误信息
+        # 记录详细的语法错误信息 (这里可以根据需要决定是否详细记录)
         # logging.debug(f"自愈脚本语法检查失败: {e}") # 避免日志过多
         return False
 
 # --- 从 script_generator.py 拷贝或适配所需的后处理函数 ---
 # 请确保 clean_code_block, remove_invalid_asserts, fix_empty_blocks, ensure_imports 在 auto_heal.py 中可用
+# 这些函数在上面已经提供了，确保它们在 heal_script 函数中可以访问到
 
 def clean_code_block(text):
     """
@@ -301,6 +351,7 @@ def ensure_imports(code):
         code = imports_block + code
 
     # 特殊处理 Playwright import，确保同时导入 sync_playwright 和 expect
+    # 检查并修复常见的 Playwright 导入方式
     if "from playwright.sync_api import sync_playwright" in code and "expect" not in code:
         code = code.replace(
             "from playwright.sync_api import sync_playwright",
@@ -311,6 +362,7 @@ def ensure_imports(code):
              "from playwright.sync_api import expect",
              "from playwright.sync_api import sync_playwright, expect"
          )
+    # Add check for 'from playwright.sync_api import *' and add missing imports if needed
 
 
     return code
@@ -343,6 +395,7 @@ if __name__ == "__main__":
             logging.info(f"已读取错误日志文件: {pytest_error_log_path}")
         except Exception as e:
             logging.warning(f"读取 {pytest_error_log_path} 失败: {e}")
+            logging.warning(traceback.format_exc())
 
 
     healed_count = 0
@@ -369,26 +422,45 @@ if __name__ == "__main__":
                  os.remove(backup_script_path)
                  logging.info(f"已删除旧的备份文件: {backup_script_path}")
 
-            os.rename(script_path, backup_script_path)
-            logging.info(f"已备份原始失败脚本: {backup_script_path}")
+            # Check if original script exists before attempting to rename
+            if os.path.exists(script_path):
+                os.rename(script_path, backup_script_path)
+                logging.info(f"已备份原始失败脚本: {backup_script_path}")
+            else:
+                logging.error(f"原始脚本 {script_path} 不存在，无法进行备份和自愈。")
+                continue # Skip healing if original script is not found
+
         except OSError as e:
             logging.error(f"备份原始失败脚本失败 {script_path}: {e}")
+            logging.error(traceback.format_exc())
             continue # 跳过当前脚本的自愈
 
         # 获取对应的原始测试用例
         # load_testcase_by_script_name 现在接收包含路径的脚本名
-        testcase = load_testcase_by_script_name(script_path, testcases_file="testcases.json")
+        testcases_file_path = "testcases.json" # Make sure testcases.json is in the workspace root
+        testcase = load_testcase_by_script_name(script_path, testcases_file=testcases_file_path)
+
         if testcase is None: # 使用 is None 因为 load_testcase_by_script_name 返回 None
             logging.error(f"无法获取脚本 {script_path} 的原始测试用例，无法进行自愈。")
             # 恢复原始文件，并记录自愈失败标记
             try:
-                os.rename(backup_script_path, script_path)
-                logging.info(f"已将备份文件 {backup_script_path} 恢复为 {script_path}")
+                # Only restore if backup exists
+                if os.path.exists(backup_script_path):
+                    os.rename(backup_script_path, script_path)
+                    logging.info(f"已将备份文件 {backup_script_path} 恢复为 {script_path}")
+                else:
+                    logging.warning(f"未找到备份文件 {backup_script_path}，无法恢复原始脚本。")
+
                 with open(heal_failed_marker, "w") as f:
                     f.write("Self-healing failed - No testcase found")
-                logging.info(f"已为 {script_path} 创建自愈失败标记文件。")
+                logging.error(f"已为 {script_path} 创建自愈失败标记文件。")
             except OSError as e:
                 logging.error(f"恢复备份文件 {backup_script_path} 失败: {e}")
+                logging.error(traceback.format_exc())
+            except Exception as e:
+                logging.error(f"处理自愈失败脚本 {script_path} (无测试用例) 时发生未知异常: {e}")
+                logging.error(traceback.format_exc())
+
             continue # 跳过当前脚本的自愈
 
 
@@ -407,22 +479,32 @@ if __name__ == "__main__":
                 # os.remove(backup_script_path) # 可选：删除备份文件
             except Exception as e:
                  logging.error(f"保存自愈脚本失败 {healed_script_path}: {e}")
+                 logging.error(traceback.format_exc())
                  # 记录自愈失败标记
                  try:
                      with open(heal_failed_marker, "w") as f:
                          f.write("Self-healing failed - Save error")
-                     logging.info(f"已为 {script_path} 创建自愈失败标记文件。")
+                     logging.error(f"已为 {script_path} 创建自愈失败标记文件。")
                  except Exception as marker_e:
                      logging.error(f"创建自愈失败标记文件失败 {heal_failed_marker}: {marker_e}")
+                     logging.error(traceback.format_exc())
                  # 恢复原始文件
                  try:
-                     os.rename(backup_script_path, script_path)
-                     logging.info(f"已将备份文件 {backup_script_path} 恢复为 {script_path}")
+                     if os.path.exists(backup_script_path):
+                         os.rename(backup_script_path, script_path)
+                         logging.info(f"已将备份文件 {backup_script_path} 恢复为 {script_path}")
+                     else:
+                          logging.warning(f"未找到备份文件 {backup_script_path}，无法恢复原始脚本。")
+
                  except OSError as e_restore:
                      logging.error(f"恢复备份文件 {backup_script_path} 失败: {e_restore}")
+                     logging.error(traceback.format_exc())
+                 except Exception as e_restore_other:
+                      logging.error(f"恢复备份文件 {backup_script_path} 时发生未知错误: {e_restore_other}")
+                      logging.error(traceback.format_exc())
 
         else:
-            logging.error(f"脚本自愈失败: {script_path}")
+            logging.error(f"脚本自愈失败: {script_path} (heal_script returned empty)")
             # heal_script 失败时已经记录了自愈失败标记和恢复了原始文件
             pass # heal_script 内部已处理失败情况
 
