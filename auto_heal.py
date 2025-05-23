@@ -8,25 +8,165 @@ import json
 import logging
 import glob
 import subprocess
-import re # Import re module
-import ast # Import ast module
-import requests # Import requests module for AI API call
-import traceback # Import traceback module
+import re
+import requests # Added imports based on function usage
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# 从环境变量获取API Key
+# 假设失败信息会写入 pytest_errors.log (由 run_tests.py 生成)
+# 假设AI生成的修复脚本以 .healed 结尾
+
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 
-# 假设失败信息会写入 pytest_errors.log (由 run_tests.py 生成)
-# 假设AI生成的修复脚本以 .healed 结尾
+def clean_code_block(text):
+    """
+    从AI返回的文本中提取JSON或Python代码块，处理可能的Markdown标记。
+    这里为了通用性，简单处理Markdown块。
+    """
+    # Decode bytes if necessary, assuming UTF-8
+    if isinstance(text, bytes):
+        text = text.decode('utf-8', errors='ignore')
+
+    # Remove potential Byte Order Mark (BOM)
+    text = text.lstrip('\ufeff')
+
+    # Regex to find potential code blocks, including those with or without language specifiers
+    # This is a simplified version focused on extracting content within ``` ```
+    match = re.search(r"```(?:[a-zA-Z]+)?\s*(.*?)\s*```", text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+
+    # If no markdown block found, return the stripped text
+    return text.strip()
+
+def ensure_imports(code):
+    """
+    确保脚本包含必要的导入，如 Playwright 的 sync_playwright 和 pytest。
+    """
+    required_imports = [
+        "import pytest",
+        "from playwright.sync_api import sync_playwright"
+    ]
+    lines = code.splitlines()
+    existing_imports = [line.strip() for line in lines if line.strip().startswith("import") or line.strip().startswith("from")]
+
+    for imp in required_imports:
+        if not any(imp in existing for existing in existing_imports):
+            # 在现有导入后或文件顶部添加缺失的导入
+            insert_index = 0
+            for i, line in enumerate(lines):
+                if line.strip().startswith("import") or line.strip().startswith("from"):
+                    insert_index = i + 1
+                elif line.strip() and not (line.strip().startswith("#") or line.strip().startswith('"""') or line.strip().startswith("'''")):
+                    # 如果遇到非导入、非注释、非 docstring 的行，则在其之前插入
+                    insert_index = i
+                    break
+            lines.insert(insert_index, imp)
+            logging.info(f"Added missing import: {imp}")
+
+    return "\n".join(lines)
+
+def add_wait_before_actions(code):
+    """
+    在 Playwright 的 fill(), click(), type() 前添加等待元素可编辑/可用状态。
+    """
+    lines = code.splitlines()
+    processed_lines = []
+    for i, line in enumerate(lines):
+        stripped_line = line.strip()
+        # 简单的正则匹配 Playwright 交互操作
+        match_fill = re.match(r'^(.*\.)fill\((.*)\)$', stripped_line)
+        match_click = re.match(r'^(.*\.)click\((.*)\)$', stripped_line)
+        match_type = re.match(r'^(.*\.)type\\((.*)\\)$', stripped_line) # Escape parenthesis for regex
+
+        if match_fill or match_click or match_type:
+            # 提取 locator 部分，例如 'page.locator("#username")'
+            locator_part = (match_fill or match_click or match_type).group(1)
+            # 插入等待可编辑的逻辑，保持原有缩进
+            indent = line[:len(line) - len(stripped_line)]
+            # 使用 state='visible' 作为通用等待状态，更安全
+            wait_line = f"{indent}{locator_part}.wait_for(state='visible', timeout=15000)" # 15秒等待
+            processed_lines.append(wait_line)
+            processed_lines.append(line) # 添加原始操作行
+        else:
+            processed_lines.append(line) # 添加非操作行
+
+    return "\n".join(processed_lines)
+
+def fix_empty_blocks_with_pass(code):
+    """
+    检查并修复空的 try, except, finally 块，插入 pass 语句。
+    """
+    lines = code.splitlines()
+    processed_lines = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        processed_lines.append(line)
+        stripped_line = line.strip()
+
+        # 检查是否是 try, except, or finally 语句的结尾
+        if stripped_line.endswith(':') and (stripped_line.startswith('try:') or stripped_line.startswith('except') or stripped_line.startswith('finally:')):
+            # 查看下一行是否是缩进的，如果不是，则表示是空块，插入 pass
+            if i + 1 < len(lines):
+                next_line = lines[i + 1]
+                current_indent = len(line) - len(stripped_line)
+                next_indent = len(next_line) - len(next_line.lstrip())
+
+                # 如果下一行缩进小于或等于当前行的缩进，或者下一行是注释或空行，则认为是空块
+                if next_indent <= current_indent or next_line.strip().startswith('#') or not next_line.strip():
+                     # 检查是否已经有 pass 语句
+                     if not next_line.strip() == 'pass':
+                         # 查找当前行的实际缩进
+                         current_line_indent = line[:len(line) - len(line.lstrip())]
+                         # 插入 pass，使用当前行的缩进加上4个空格
+                         processed_lines.append(f"{current_line_indent}    pass") # 假设使用4个空格缩进
+
+            else:
+                 # 如果是最后一行且是 try, except, finally 结尾，也认为是空块，插入 pass
+                 current_line_indent = line[:len(line) - len(line.lstrip())]
+                 processed_lines.append(f"{current_line_indent}    pass") # 假设使用4个空格缩进
+
+        i += 1
+    return "\n".join(processed_lines)
+
+
+def is_valid_python(code):
+    """
+    检查给定的字符串是否是有效的Python代码。
+    """
+    try:
+        compile(code, "<string>", "exec")
+        return True
+    except IndentationError as e:
+        logging.error(f"代码存在缩进错误: {e}")
+        return False
+    except SyntaxError as e:
+        logging.error(f"代码存在语法错误: {e}")
+        return False
+    except Exception as e:
+        logging.error(f"检查代码有效性时发生未知错误: {e}")
+        return False
+
+
+def post_process_script(code):
+    """
+    对生成的脚本进行后处理，例如移除无效断言、确保必要导入、修复空块等。
+    """
+    # code = clean_code_block(code) # clean_code_block 应该在获取AI响应后立即调用
+    # code = remove_invalid_asserts(code) # 如果需要移除特定断言，可以在这里实现
+    code = ensure_imports(code) # 确保导入
+    code = add_wait_before_actions(code) # 添加等待
+    code = fix_empty_blocks_with_pass(code) # 修复空块
+    return code
 
 def get_failed_tests_from_log(log_file="pytest_errors.log"):
     """
     从pytest错误日志中解析失败的测试文件列表 (简易解析，可根据实际日志格式调整)
     更健壮的方式是解析Allure报告或JUnit XML报告
+    这里也尝试解析收集错误（IndentationError等）。
     """
     failed_files = set()
     if not os.path.exists(log_file):
@@ -38,38 +178,32 @@ def get_failed_tests_from_log(log_file="pytest_errors.log"):
             content = f.read()
             # 查找类似 "FAILED path/to/test_file.py::test_name" 的行
             # 或者查找测试文件名的模式
-            # 这里的正则需要根据实际pytest失败日志格式调整，确保提取包含路径的文件名
-            # [\w\\/\.-]+ 匹配单词、反斜杠、斜杠、点、破折号至少一次
-            matches = re.findall(r"FAILED\s+([\w\\/\.-]+\.py)(?::|$)", content) # 匹配 FAILED 后面的 .py 文件名，可能带::分隔符
-            # 查找 collection errors
-            collection_errors = re.findall(r"ERROR collecting\s+([\w\\/\.-]+\.py)", content)
-
-            all_potential_failures = set(matches).union(set(collection_errors))
-
+            matches = re.findall(r"FAILED\s+([\w\\/\.-]+\.py)::", content)
             # 过滤掉 .healed 脚本，避免重复自愈
-            failed_files = {f for f in all_potential_failures if not f.endswith(".healed")}
+            failed_files.update({f for f in matches if not f.endswith(".healed")})
 
+            # 检查是否有 NameError 或 IndentationError 等收集错误
+            collection_errors = re.findall(r"ERROR collecting\s+([\w\\/\.-]+\.py)", content)
+            failed_files.update({f for f in collection_errors if not f.endswith(".healed")})
 
     except Exception as e:
         logging.error(f"解析pytest错误日志失败: {e}")
-        logging.error(traceback.format_exc())
         return []
 
-    logging.info(f"从日志中解析到以下失败/收集错误脚本: {list(failed_files)}")
+    logging.info(f"从日志中解析到以下失败/收集错误脚本: {failed_files}")
     return list(failed_files)
 
 
-def load_testcase_by_script_name(script_path, testcases_file="testcases.json"):
+def load_testcase_by_script_name(script_name, testcases_file="testcases.json"):
     """
-    根据失败的脚本完整路径，查找对应的原始测试用例
-    脚本路径格式如 playwright_scripts/test_playwright_1.py
+    根据失败的脚本文件名，查找对应的原始测试用例
+    脚本文件名格式如 playwright_test_1.py
     """
-    # 从路径中提取文件名
-    script_name = os.path.basename(script_path)
-
     try:
-        # 从文件名中提取索引，例如 test_playwright_1.py -> 1
-        match = re.search(r"test_playwright_(\d+)\.py$", script_name)
+        # 从文件名中提取索引，例如 playwright_test_1.py -> 1
+        # 移除目录部分，只匹配文件名
+        base_script_name = os.path.basename(script_name)
+        match = re.search(r"test_playwright_(\d+)\.py(?:\.healed)?$", base_script_name) # 考虑 .healed 结尾
         if not match:
             logging.warning(f"脚本文件名格式不匹配，无法找到对应用例: {script_name}")
             return None
@@ -86,12 +220,50 @@ def load_testcase_by_script_name(script_path, testcases_file="testcases.json"):
         if isinstance(testcases, list) and 0 <= testcase_index < len(testcases):
             return testcases[testcase_index]
         else:
-            logging.warning(f"测试用例文件格式错误或索引 {testcase_index} 超出范围 {len(testcases)}。")
+            logging.warning(f"测试用例文件格式错误或索引超出范围: {testcase_index}")
             return None
 
     except Exception as e:
         logging.error(f"根据脚本名查找测试用例失败 {script_name}: {e}")
-        logging.error(traceback.format_exc())
+        return None
+
+
+def call_deepseek_api(prompt):
+    """
+    调用 DeepSeek API 获取自愈后的脚本代码。
+    """
+    if not DEEPSEEK_API_KEY:
+        logging.error("DEEPSEEK_API_KEY 环境变量未设置，无法调用API！")
+        return None
+
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    data = {
+        "model": "deepseek-chat",
+        "messages": [
+            {"role": "system", "content": "You are a helpful AI assistant that refactors Python code. Focus on fixing syntax and runtime errors."},
+            {"role": "user", "content": prompt}
+        ],
+        "stream": False
+    }
+
+    try:
+        response = requests.post(DEEPSEEK_API_URL, headers=headers, json=data)
+        response.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
+        result = response.json()
+        if result and result['choices'] and result['choices'][0]['message']['content']:
+            return result['choices'][0]['message']['content']
+        else:
+            logging.warning("DeepSeek API 返回空内容或格式错误。")
+            return None
+    except requests.exceptions.RequestException as e:
+        logging.error(f"调用 DeepSeek API 失败: {e}")
+        return None
+    except Exception as e:
+        logging.error(f"处理 API 响应失败: {e}")
         return None
 
 
@@ -100,10 +272,7 @@ def heal_script(original_script_path, testcase, error_info):
     调用AI自愈失败的脚本
     """
     logging.info(f"正在自愈脚本: {original_script_path}")
-    # 打印部分错误信息，避免日志过长
-    error_snippet = error_info if len(error_info) < 500 else error_info[:490] + "..."
-    logging.info(f"失败信息片段: \n---\n{error_snippet}\n---")
-
+    logging.info(f"失败信息: {error_info[:500]}...") # 打印部分错误信息
 
     # 读取原始失败脚本内容
     try:
@@ -111,404 +280,171 @@ def heal_script(original_script_path, testcase, error_info):
             original_code = f.read()
     except Exception as e:
         logging.error(f"读取原始失败脚本失败 {original_script_path}: {e}")
-        logging.error(traceback.format_exc())
         return ""
 
-    if not DEEPSEEK_API_KEY:
-        logging.error("DEEPSEEK_API_KEY 环境变量未设置，无法调用API进行自愈！")
+    # 构建给AI的Prompt
+    prompt = f"""
+我有一个Playwright自动化测试脚本在运行时或收集时失败了。
+原始脚本文件路径：{original_script_path}
+对应的原始测试用例（JSON格式）：
+```json
+{json.dumps(testcase, indent=2, ensure_ascii=False)}
+```
+脚本代码如下：
+```python
+{original_code}
+```
+错误信息如下：
+请根据提供的测试用例和错误信息，修复这个Python脚本。修复后的代码应该是一个完整的、可运行的pytest Playwright测试脚本。特别注意修复缩进错误、定位器问题或超时问题。只返回修复后的Python代码，不要包含任何解释或其他文本，将代码放在Markdown代码块中。
+"""
+
+    logging.info("正在调用AI进行自愈...")
+    healed_code_raw = call_deepseek_api(prompt)
+
+    if not healed_code_raw:
+        logging.error("AI自愈返回空内容。")
         return ""
 
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    # 清理AI返回的代码块
+    healed_code = clean_code_block(healed_code_raw)
 
-    # 构建自愈prompt
-    prompt = (
-        "以下是一个Playwright+Python自动化测试脚本及其执行时的失败信息。请分析失败原因，并提供一个修复后的完整Playwright+Python自动化测试脚本。\n"
-        "--- 原始脚本 ---\n```python\n{original_code}\n```\n"
-        "--- 原始测试用例 ---\n```json\n{testcase_json}\n```\n"
-        "--- 失败信息/错误日志 ---\n```\n{error_info}\n```\n"
-        "--- 修复要求 ---\n"
-        "请提供完整的可运行脚本，包含所有必要的import（特别是 Playwright 相关、time, re, pytest, os, json, traceback, logging）。\n"
-        "重点根据失败信息（IndentationError, NameError, Playwright Specific errors etc.）修复选择器、等待条件、断言或逻辑错误。\n"
-        "保持原测试用例的场景和步骤意图。\n"
-        "所有中文注释用三引号风格，不要用#。\n"
-        "测试函数不带任何参数，函数名应符合 pytest 的测试函数命名规则 (以 test_ 开头)。\n"
-        "统一用 `with sync_playwright() as p:` 方式启动 Playwright。\n"
-        "不要用本地文件路径，统一用实际可访问的URL（如 http://10.0.62.222:30050/ ）。\n"
-        "如果修复涉及元素定位，请尽量使用更稳定可靠的Playwright定位器，如 `get_by_role`, `get_by_text`, `get_by_label`, `get_by_test_id` 等，避免复杂的CSS/XPath，除非AI能生成准确无误的复杂选择器。\n"
-        "如果某个步骤无法实现有效的断言，请用 `pass` 占位。\n"
-        "修复所有缩进错误。\n"
-        "输出内容只包含修复后的脚本代码，不要包含额外的文字、markdown标记（如```python```），直接提供Python代码。"
-    ).format(
-        original_code=original_code,
-        testcase_json=json.dumps(testcase, ensure_ascii=False, indent=2),
-        error_info=error_info
-    )
+    # 对自愈后的代码进行后处理
+    healed_code = post_process_script(healed_code)
 
-    data = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}], "temperature": 0.5} # 可适当降低temperature使AI更稳定
+    # 最终检查修复后的代码是否是有效的Python
+    if not is_valid_python(healed_code):
+        logging.error("AI自愈后的代码不是有效的Python代码，放弃保存。")
+        # 可以选择将无效代码保存到一个临时文件以便调试
+        # with open(f"{original_script_path}.invalid", "w", encoding="utf-8") as f:
+        #     f.write(healed_code)
+        return ""
 
+    # 生成修复后的文件名
+    healed_script_path = f"{original_script_path}.healed"
+
+    # 保存修复后的脚本
     try:
-        response = requests.post(DEEPSEEK_API_URL, headers=headers, json=data, timeout=180) # 增加超时时间
-        response.raise_for_status()
-        resp_json = response.json()
-
-        if "choices" not in resp_json or not resp_json["choices"]:
-            logging.error(f"AI自愈返回内容异常或为空: {resp_json}")
-            return ""
-
-        healed_code = resp_json["choices"][0]["message"]["content"]
-        logging.info("AI自愈脚本已获取，开始后处理...")
-
-        # 后处理（与script_generator类似，确保语法、导入等正确）
-        healed_code = clean_code_block(healed_code)
-        healed_code = remove_invalid_asserts(healed_code) # 自愈后也可能带无效断言
-        healed_code = fix_empty_blocks(healed_code) # 自愈后也可能带空块
-        healed_code = ensure_imports(healed_code) # 确保导入
-
-        # 在 fill(), click(), type() 前添加等待可编辑/可用状态
-        lines = healed_code.splitlines()
-        processed_lines = []
-        for i, line in enumerate(lines):
-            stripped_line = line.strip()
-            # 简单的正则匹配 Playwright 交互操作
-            match_fill = re.match(r'^(.*\.)fill\((.*)\)$', stripped_line)
-            match_click = re.match(r'^(.*\.)click\((.*)\)$', stripped_line)
-            match_type = re.match(r'^(.*\.)type\\((.*)\\)$', stripped_line) # 修复了 type() 方法的正则
-
-            if match_fill or match_click or match_type:
-                locator_part = (match_fill or match_click or match_type).group(1)
-                # 插入等待可编辑的逻辑，保持原有缩进
-                indent = line[:len(line) - len(stripped_line)]
-                wait_line = f"{indent}{locator_part}.wait_for(state=\\'editable\\', timeout=10000)" # 10秒等待可编辑
-                processed_lines.append(wait_line)
-                processed_lines.append(line) # 添加原始操作行
-            else:
-                processed_lines.append(line) # 添加非操作行
-
-        healed_code = "\\n".join(processed_lines)
-
-
-        # 最终语法检查
-        if not is_valid_python(healed_code):
-             logging.warning("自愈后的代码存在语法问题。")
-             # 将失败的脚本移回原位（从.bak恢复），并记录自愈失败标记
-             try:
-                 # Check if backup file exists before attempting to restore
-                 if os.path.exists(original_script_path + ".bak"):
-                     os.rename(original_script_path + ".bak", original_script_path)
-                     logging.info(f"已将备份文件 {original_script_path + '.bak'} 恢复为 {original_script_path}")
-                 else:
-                     logging.warning(f"未找到备份文件 {original_script_path + '.bak'}，无法恢复原始脚本。")
-
-                 # 记录自愈失败标记，避免下次继续尝试自愈
-                 heal_failed_marker = original_script_path + ".heal_failed"
-                 with open(heal_failed_marker, "w") as f:
-                     f.write("Self-healing failed due to invalid Python syntax")
-                 logging.error(f"已为 {original_script_path} 创建自愈失败标记文件。")
-
-             except OSError as e:
-                 logging.error(f"处理自愈失败脚本 {original_script_path} 时发生OSError: {e}")
-             except Exception as e:
-                 logging.error(f"处理自愈失败脚本 {original_script_path} 时发生未知异常: {e}")
-
-             return "" # 返回空字符串表示自愈失败
-
-
-        logging.info("自愈脚本后处理完成，语法检查通过。")
-        return healed_code
-
-    except requests.exceptions.RequestException as e:
-        logging.error(f"调用 deepseek-chat API 自愈请求失败: {e}")
-        logging.error(traceback.format_exc())
+        with open(healed_script_path, "w", encoding="utf-8") as f:
+            f.write(healed_code)
+        logging.info(f"自愈后的脚本已保存到: {healed_script_path}")
+        return healed_script_path
+    except Exception as e:
+        logging.error(f"保存自愈后脚本失败 {healed_script_path}: {e}")
         return ""
-    except json.JSONDecodeError as e:
-         logging.error(f"解析 deepseek-chat API 自愈返回的JSON失败: {e}")
-         logging.error(traceback.format_exc())
-         return ""
-    except Exception as e:
-        logging.error(f"自愈脚本过程中发生未知错误: {e}")
-        logging.error(traceback.format_exc())
-        # 在发生意外错误时也恢复备份文件并标记自愈失败
-        try:
-            if os.path.exists(original_script_path + ".bak"):
-                os.rename(original_script_path + ".bak", original_script_path)
-                logging.info(f"已将备份文件 {original_script_path + '.bak'} 恢复为 {original_script_path}")
-            else:
-                logging.warning(f"未找到备份文件 {original_script_path + '.bak'}，无法恢复原始脚本。")
 
-            heal_failed_marker = original_script_path + ".heal_failed"
-            with open(heal_failed_marker, "w") as f:
-                f.write(f"Self-healing failed with exception: {e}")
-            logging.error(f"已为 {original_script_path} 创建自愈失败标记文件。")
-        except Exception as cleanup_e:
-            logging.error(f"自愈失败清理过程中发生错误: {cleanup_e}")
-
-        return "" # 返回空字符串表示自愈失败
-
-def is_valid_python(code):
+def run_healed_tests(healed_files, allure_dir="allure-results", max_retries=1):
     """
-    使用AST检查代码是否是合法的Python语法
+    运行修复后的测试脚本。
     """
-    try:
-        # 尝试解析代码
-        ast.parse(code)
-        return True
-    except Exception as e:
-        # 记录详细的语法错误信息 (这里可以根据需要决定是否详细记录)
-        # logging.debug(f"自愈脚本语法检查失败: {e}") # 避免日志过多
-        return False
+    logging.info(f"正在运行自愈后的测试脚本: {healed_files}")
 
-# --- 从 script_generator.py 拷贝或适配所需的后处理函数 ---
-# 请确保 clean_code_block, remove_invalid_asserts, fix_empty_blocks, ensure_imports 在 auto_heal.py 中可用
-# 这些函数在上面已经提供了，确保它们在 heal_script 函数中可以访问到
+    success = True
+    # 针对每个修复的文件单独运行，这样即使部分修复失败也不影响其他修复成功的
+    for healed_file in healed_files:
+        if not os.path.exists(healed_file):
+            logging.warning(f"自愈后的脚本文件不存在，跳过运行: {healed_file}")
+            success = False # 认为整体修复运行失败
+            continue
 
-def clean_code_block(text):
-    """
-    去除AI返回的 markdown 代码块标记，包括```python和```等
-    """
-    text = text.strip()
-    # 尝试查找是否有 markdown 代码块
-    match = re.search(r"```(?:python)?\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
-    if match:
-        return match.group(1).strip()
+        logging.info(f"正在运行自愈脚本: {healed_file}")
+        # 构建pytest命令，只运行当前修复的文件
+        # --clean-alluredir 不清空，以便合并报告
+        command = ["pytest", healed_file, f"--alluredir={allure_dir}"]
 
-    # 如果没有找到 markdown 代码块，尝试清理常见的前后缀
-    if text.startswith("'''python"):
-        text = text[len("'''python"):].strip()
-    elif text.startswith("```python"):
-         text = text[len("```python"):].strip()
-    elif text.startswith("```") or text.startswith("'''"):
-        first_newline = text.find("\n")
-        if first_newline != -1:
-            text = text[first_newline + 1 :]
+        # 添加重试逻辑
+        for attempt in range(max_retries + 1):
+            logging.info(f"执行命令 (尝试 {attempt + 1}/{max_retries + 1}): {' '.join(command)}")
+            try:
+                result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8', check=False)
 
-    if text.endswith("```") or text.endswith("'''"):
-        text = text.rsplit("\n", 1)[0]
+                logging.info(f"Pytest 执行完成 for {healed_file}.")
+                logging.info("--- Pytest 标准输出 ---")
+                logging.info(result.stdout)
+                logging.info("--- Pytest 标准错误 ---")
+                logging.error(result.stderr) # 运行失败的错误输出应该用error级别
+                logging.info(f"--- Pytest 执行结束 for {healed_file} ---")
 
-    # 移除可能的BOM字符
-    text = text.lstrip('\ufeff')
+                if result.returncode == 0:
+                    logging.info(f"自愈脚本 {healed_file} 执行成功。")
+                    break # 成功则跳出重试循环
+                else:
+                    logging.warning(f"自愈脚本 {healed_file} 执行失败，退出码: {result.returncode}. 标准错误:\n{result.stderr}")
+                    if attempt < max_retries:
+                        logging.info(f"正在重试运行 {healed_file}...")
+                        # 可选：在重试前等待一段时间
+                        # import time
+                        # time.sleep(5)
+                    else:
+                        logging.error(f"自愈脚本 {healed_file} 在 {max_retries + 1} 次尝试后仍然失败。")
+                        success = False # 标记整体失败
+            except FileNotFoundError:
+                logging.error("未找到 pytest 命令。请确保 pytest 已安装。")
+                success = False # 标记整体失败
+                break # 命令都找不到，重试也没用
+            except Exception as e:
+                logging.error(f"运行自愈脚本 {healed_file} 时发生异常: {e}")
+                success = False # 标记整体失败
+                break # 发生异常，停止重试
 
-    return text.strip()
-
-
-def remove_invalid_asserts(code):
-    """
-    自动去除AI生成脚本中的 assert False 相关无效断言
-    """
-    # 更精确地匹配 assert False 或 assert(False)
-    return re.sub(r'^\s*assert\s+\(?False\)?\s*$', '', code, flags=re.MULTILINE)
-
-
-def fix_empty_blocks(code):
-    """
-    补全 else/except/finally 后面没有代码的情况
-    """
-    # 匹配 else/except/finally 后面只有冒号，接着是换行和可选的空白或#注释
-    # 在其下方插入 'pass' 并正确缩进
-    # (\1:) 捕获并保留 "else:" 或 "except SomeError:" 等
-    # (\n\s*) 匹配换行和后面的空白
-    # ($|#.*) 匹配行尾或者 #注释到行尾
-    # r'\1:\n    pass\2' 替换为 原来的冒号行，加上新行缩进的 'pass'，再加上捕获的行尾（换行或注释）
-    code = re.sub(r'(else|except[^:]*|finally):\s*(\n\s*($|#.*))', r'\1:\n    pass\2', code, flags=re.MULTILINE)
-
-    # 处理 else/except/finally 后面是字符串的情况（AI偶尔会生成这种情况）
-    code = re.sub(r'(else|except[^:]*|finally):\s*(["\'](?:.*?)["\'])', r'\1:\n    pass # Original was: \2', code, flags=re.MULTILINE)
-
-    return code
-
-
-def ensure_imports(code):
-    """
-    确保脚本包含必要的 import 语句 (针对自愈脚本的需要)
-    """
-    required_imports = {
-        "from playwright.sync_api import sync_playwright, expect", # Playwright core
-        "import time", # Often used for waits
-        "import re", # Used in some generated code or helper functions
-        "import pytest", # For pytest framework
-        "import os", # May be needed for file operations or env vars
-        "import json", # May be needed for data handling
-        "import traceback", # Useful for debugging in tests
-        "import logging" # For logging within tests
-    }
-    existing_imports = set()
-    # 简单提取现有 imports
-    for line in code.splitlines():
-        line = line.strip()
-        if line.startswith("import ") or line.startswith("from "):
-            existing_imports.add(line)
-        # 遇到非import或from的行就停止查找imports，假设imports都在文件开头
-        elif line:
-            break
-
-    imports_to_add = sorted(list(required_imports - existing_imports)) # 按字母排序要添加的 imports
-
-    # 将需要添加的 imports 放在文件开头
-    if imports_to_add:
-        imports_block = "\n".join(imports_to_add) + "\n\n"
-        code = imports_block + code
-
-    # 特殊处理 Playwright import，确保同时导入 sync_playwright 和 expect
-    # 检查并修复常见的 Playwright 导入方式
-    if "from playwright.sync_api import sync_playwright" in code and "expect" not in code:
-        code = code.replace(
-            "from playwright.sync_api import sync_playwright",
-            "from playwright.sync_api import sync_playwright, expect"
-        )
-    elif "from playwright.sync_api import expect" in code and "sync_playwright" not in code:
-         code = code.replace(
-             "from playwright.sync_api import expect",
-             "from playwright.sync_api import sync_playwright, expect"
-         )
-    # Add check for 'from playwright.sync_api import *' and add missing imports if needed
-
-
-    return code
-
-
-# --------------------------------------------
+    return success
 
 
 if __name__ == "__main__":
-    logging.info("开始执行自动故障检测与自愈流程...")
+    # 假设 pytest_errors.log 包含上一步运行测试的失败信息
+    error_log_file = "pytest_errors.log"
+    testcases_file = "testcases.json" # 测试用例文件
 
-    # 获取需要自愈的失败脚本列表
-    # get_failed_tests_from_log 现在会返回包含路径的文件名，如 playwright_scripts/test_playwright_1.py
-    failed_scripts = get_failed_tests_from_log()
+    failed_scripts = get_failed_tests_from_log(error_log_file)
 
     if not failed_scripts:
-        logging.info("未检测到失败脚本，自愈流程结束。")
-        exit(0) # 没有失败脚本，正常退出
+        logging.info("没有需要自愈的失败脚本。")
+        exit(0) # 没有失败，退出码为0
 
-    logging.info(f"检测到以下失败脚本需要自愈: {failed_scripts}")
+    healed_scripts = []
+    overall_healing_success = True
 
-    # 读取原始的pytest错误日志，用于传递给AI
-    error_info = ""
-    # 检查 pytest_errors.log 是否存在并读取
-    pytest_error_log_path = "pytest_errors.log"
-    if os.path.exists(pytest_error_log_path):
+    # 读取整个错误日志内容，提供给AI
+    error_info_full = ""
+    if os.path.exists(error_log_file):
         try:
-            with open(pytest_error_log_path, "r", encoding="utf-8") as f:
-                error_info = f.read()
-            logging.info(f"已读取错误日志文件: {pytest_error_log_path}")
+            with open(error_log_file, "r", encoding="utf-8") as f:
+                error_info_full = f.read()
         except Exception as e:
-            logging.warning(f"读取 {pytest_error_log_path} 失败: {e}")
-            logging.warning(traceback.format_exc())
+            logging.error(f"读取完整错误日志失败: {e}")
+            error_info_full = "无法读取完整的错误日志。"
 
-
-    healed_count = 0
     for script_path in failed_scripts:
-        # 检查对应的 .healed 文件是否已存在，避免重复生成
-        healed_script_path = script_path + ".healed"
-        # 同时检查自愈失败标记文件
-        heal_failed_marker = script_path + ".heal_failed"
+        logging.info(f"尝试自愈脚本: {script_path}")
+        # 从完整错误信息中提取当前脚本相关的错误部分，如果可能
+        # 这是一个简化的实现，实际可能需要更复杂的日志解析
+        script_error_info = f"脚本 {script_path} 的错误信息:\n" + error_info_full # 简单地附上完整日志
 
-        if os.path.exists(healed_script_path):
-             logging.info(f"自愈脚本 {healed_script_path} 已存在，跳过自愈。")
-             healed_count += 1 # 算作已处理
-             continue
-        if os.path.exists(heal_failed_marker):
-             logging.info(f"脚本 {script_path} 存在自愈失败标记，跳过自愈。")
-             continue
+        testcase = load_testcase_by_script_name(script_path, testcases_file)
 
-
-        # 备份原始失败脚本
-        backup_script_path = script_path + ".bak"
-        try:
-            # 如果备份文件已存在，先删除（可能是上次自愈失败残留）
-            if os.path.exists(backup_script_path):
-                 os.remove(backup_script_path)
-                 logging.info(f"已删除旧的备份文件: {backup_script_path}")
-
-            # Check if original script exists before attempting to rename
-            if os.path.exists(script_path):
-                os.rename(script_path, backup_script_path)
-                logging.info(f"已备份原始失败脚本: {backup_script_path}")
+        if testcase:
+            healed_script_path = heal_script(script_path, testcase, script_error_info)
+            if healed_script_path and os.path.exists(healed_script_path):
+                healed_scripts.append(healed_script_path)
             else:
-                logging.error(f"原始脚本 {script_path} 不存在，无法进行备份和自愈。")
-                continue # Skip healing if original script is not found
-
-        except OSError as e:
-            logging.error(f"备份原始失败脚本失败 {script_path}: {e}")
-            logging.error(traceback.format_exc())
-            continue # 跳过当前脚本的自愈
-
-        # 获取对应的原始测试用例
-        # load_testcase_by_script_name 现在接收包含路径的脚本名
-        testcases_file_path = "testcases.json" # Make sure testcases.json is in the workspace root
-        testcase = load_testcase_by_script_name(script_path, testcases_file=testcases_file_path)
-
-        if testcase is None: # 使用 is None 因为 load_testcase_by_script_name 返回 None
-            logging.error(f"无法获取脚本 {script_path} 的原始测试用例，无法进行自愈。")
-            # 恢复原始文件，并记录自愈失败标记
-            try:
-                # Only restore if backup exists
-                if os.path.exists(backup_script_path):
-                    os.rename(backup_script_path, script_path)
-                    logging.info(f"已将备份文件 {backup_script_path} 恢复为 {script_path}")
-                else:
-                    logging.warning(f"未找到备份文件 {backup_script_path}，无法恢复原始脚本。")
-
-                with open(heal_failed_marker, "w") as f:
-                    f.write("Self-healing failed - No testcase found")
-                logging.error(f"已为 {script_path} 创建自愈失败标记文件。")
-            except OSError as e:
-                logging.error(f"恢复备份文件 {backup_script_path} 失败: {e}")
-                logging.error(traceback.format_exc())
-            except Exception as e:
-                logging.error(f"处理自愈失败脚本 {script_path} (无测试用例) 时发生未知异常: {e}")
-                logging.error(traceback.format_exc())
-
-            continue # 跳过当前脚本的自愈
-
-
-        # 调用AI进行自愈
-        healed_code = heal_script(backup_script_path, testcase, error_info)
-
-        if healed_code:
-            # 保存自愈后的脚本
-            try:
-                with open(healed_script_path, "w", encoding="utf-8") as f:
-                    f.write(healed_code)
-                logging.info(f"自愈成功，已保存修复脚本: {healed_script_path}")
-                healed_count += 1
-                # 自愈成功后，可以考虑删除原始失败脚本（backup_script_path）
-                # 或者保留备份文件，根据偏好决定
-                # os.remove(backup_script_path) # 可选：删除备份文件
-            except Exception as e:
-                 logging.error(f"保存自愈脚本失败 {healed_script_path}: {e}")
-                 logging.error(traceback.format_exc())
-                 # 记录自愈失败标记
-                 try:
-                     with open(heal_failed_marker, "w") as f:
-                         f.write("Self-healing failed - Save error")
-                     logging.error(f"已为 {script_path} 创建自愈失败标记文件。")
-                 except Exception as marker_e:
-                     logging.error(f"创建自愈失败标记文件失败 {heal_failed_marker}: {marker_e}")
-                     logging.error(traceback.format_exc())
-                 # 恢复原始文件
-                 try:
-                     if os.path.exists(backup_script_path):
-                         os.rename(backup_script_path, script_path)
-                         logging.info(f"已将备份文件 {backup_script_path} 恢复为 {script_path}")
-                     else:
-                          logging.warning(f"未找到备份文件 {backup_script_path}，无法恢复原始脚本。")
-
-                 except OSError as e_restore:
-                     logging.error(f"恢复备份文件 {backup_script_path} 失败: {e_restore}")
-                     logging.error(traceback.format_exc())
-                 except Exception as e_restore_other:
-                      logging.error(f"恢复备份文件 {backup_script_path} 时发生未知错误: {e_restore_other}")
-                      logging.error(traceback.format_exc())
-
+                logging.error(f"自愈脚本 {script_path} 失败。")
+                overall_healing_success = False
         else:
-            logging.error(f"脚本自愈失败: {script_path} (heal_script returned empty)")
-            # heal_script 失败时已经记录了自愈失败标记和恢复了原始文件
-            pass # heal_script 内部已处理失败情况
+            logging.error(f"找不到脚本 {script_path} 对应的测试用例，跳过自愈。")
+            overall_healing_success = False # 找不到用例也算自愈失败
 
+    if not healed_scripts:
+        logging.error("没有脚本成功自愈。自愈阶段失败。")
+        exit(1) # 没有成功自愈的脚本，退出码为1
 
-    logging.info(f"自愈流程完成，共尝试自愈 {len(failed_scripts)} 个脚本，成功生成 {healed_count} 个修复脚本。")
+    logging.info(f"成功自愈以下脚本: {healed_scripts}")
 
-    # 注意：Jenkinsfile 中会单独执行 Re-Run Healed Tests 阶段，这里不需要再次运行测试
+    # 运行修复后的测试脚本
+    logging.info("运行自愈后的测试...")
+    run_success = run_healed_tests(healed_scripts)
+
+    if run_success:
+        logging.info("所有自愈后的测试运行成功。")
+        exit(0) # 修复后的测试运行成功，退出码为0
+    else:
+        logging.error("运行自愈后的测试失败。自愈阶段最终失败。")
+        exit(1) # 修复后的测试运行失败，退出码为1
