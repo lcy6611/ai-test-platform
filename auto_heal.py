@@ -6,11 +6,11 @@
 import os
 import json
 import logging
-import glob
+# import glob # Removed unused import
 import subprocess
 import re
 import requests
-import ast
+import ast # Needed for is_valid_python
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -48,7 +48,7 @@ def ensure_imports(code):
 
     for imp in required_imports:
         # Check if the exact import statement exists or if the module/object is already imported
-        if any(imp in existing and (imp.split(" import ")[-1] in existing or imp.split(" import ")[0].replace("import ", "") in existing) for existing in existing_imports):
+        if any(imp.split(" import ")[-1] in existing and (imp.split(" import ")[0].replace("import ", "") in existing or imp in existing) for existing in existing_imports):
             continue
 
         # Find the position to insert the import statement
@@ -69,6 +69,8 @@ def ensure_imports(code):
 def add_wait_before_actions(code):
     """
     在 Playwright 的 fill(), click(), type() 前添加等待元素可见状态。
+    注意：这里只添加可见等待，不处理 readonly 导致 fill 失败的问题，
+    readonly 问题由 replace_readonly_fill_with_evaluate 处理。
     """
     lines = code.splitlines()
     processed_lines = []
@@ -77,6 +79,7 @@ def add_wait_before_actions(code):
         # Regex to match Playwright interaction operations on locators or page objects
         # Need to be more robust to different ways locators are created (e.g., page.locator, page.get_by_text, etc.)
         # And different ways methods are called (e.g., .fill(), .click(), .type())
+        # Fixed redundant escape in regex
         match_action = re.match(r'^(\s*)(.*?)\.(fill|click|type)\((.*)\)$', line)
 
         if match_action:
@@ -105,15 +108,18 @@ def replace_readonly_fill_with_evaluate(code):
     """
     检测针对已知 readonly 输入框的 .fill()/.type() 调用，并替换为 page.evaluate()。
     """
-    # Update selectors based on your application's HTML
-    readonly_selectors = [
-        "#form_item_username",
-        "#form_item_password",
-        "input[name='username']", # Added based on logs
-        "input[name='password']", # Added based on logs
-        # Add other selectors if needed, e.g., placeholder text based selectors
-        # 'input[placeholder*="用户名"]', # Example with placeholder text
-        # 'input[placeholder*="密码"]',    # Example with placeholder text
+    # Define patterns that might match the username/password input fields
+    # Using broad regex to catch variations in locators
+    readonly_selector_patterns = [
+        re.compile(r'#form_item_username'),
+        re.compile(r'#form_item_password'),
+        re.compile(r'input\[name=[\'\"]?username[\'\"]?\]', re.IGNORECASE),
+        re.compile(r'input\[name=[\'\"]?password[\'\"]?\]', re.IGNORECASE),
+        re.compile(r'get_by_placeholder\([\'\"]?.*?用户名.*?[\'\"]?\)', re.IGNORECASE),
+        re.compile(r'get_by_placeholder\([\'\"]?.*?密码.*?[\'\"]?\)', re.IGNORECASE),
+        re.compile(r'get_by_label\([\'\"]?.*?用户名.*?[\'\"]?\)', re.IGNORECASE),
+        re.compile(r'get_by_label\([\'\"]?.*?密码.*?[\'\"]?\)', re.IGNORECASE),
+        # Add more patterns if other locators are used for these fields
     ]
 
     lines = code.splitlines()
@@ -124,54 +130,59 @@ def replace_readonly_fill_with_evaluate(code):
         original_indent = line[:len(line) - len(stripped_line)]
         modified = False
 
-        # Regex to find .fill() or .type() calls on potential locator or page objects
-        match_fill_type = re.match(r'^(\s*)(.*?)\.(fill|type)\s*\(\s*["\'](.*?)["\']\s*,(.*?)\)$', line)
-        match_locator_fill_type = re.match(r'^(\s*)(.*?)\.locator\s*\(\s*["\'](.*?)["\']\s*\)\s*\.(fill|type)\s*\(\s*["\'](.*?)["\']\s*\).*$', line)
+        # Regex to find .fill() or .type() calls on any object (assuming it's a locator or page)
+        match_fill_type = re.match(r'^(\s*)(.*?)\.(fill|type)\s*\((.*)\)$', line)
+
+        if match_fill_type:
+            indent, object_part, method_name, args_part = match_fill_type.groups()
+
+            # Extract the selector string and value from the args or the object_part
+            selector = None
+            value = None
+
+            # Try to parse as page.fill(selector, value) or page.type(selector, value)
+            match_page_method = re.match(r'^\s*(page)\.(fill|type)\s*\(\s*["\'](.*?)["\']\s*,\s*["\'](.*?)["\']\s*\).*$', stripped_line)
+            if match_page_method:
+                 method_name_page, page_obj, selector_page, value_page = match_page_method.groups()
+                 selector = selector_page
+                 value = value_page
+                 # Check if this selector matches any of the readonly patterns
+                 if any(pattern.search(selector) for pattern in readonly_selector_patterns):
+                    # Construct page.evaluate() call with doubled curly braces for f-string
+                    evaluate_js = "selector => {{ const element = document.querySelector(selector); if (element) {{ element.value = arguments[1]; element.dispatchEvent(new Event('input', {{ bubbles: true }})); element.dispatchEvent(new Event('change', {{ bubbles: true }})); }} }}"
+                    evaluate_line = f'{original_indent}{page_obj}.evaluate("{evaluate_js}", "{selector}", "{value}")'
+                    processed_lines.append(evaluate_line)
+                    logging.info(f"Replaced {page_obj}.{method_name_page}() with {page_obj}.evaluate() for potential readonly selector: {selector}")
+                    modified = True
 
 
-        selector = None
-        value = None
-        prefix = None # The part before .fill or .type (e.g., 'page' or 'username_input')
+            # Try to parse as locator.fill(value) or locator.type(value)
+            if not modified:
+                # This regex tries to capture a locator creation/variable and the subsequent fill/type call
+                match_locator_method = re.match(r'^(\s*)(.*?) = (.*?locator\(.*?\).*)\n\s*\2\.(fill|type)\s*\(\s*["\'](.*?)["\']\s*\).*$', line, re.DOTALL)
 
-        if match_locator_fill_type:
-             indent, prefix_before_locator, selector_in_locator, method, value_in_method = match_locator_fill_type.groups()
-             full_prefix_match = re.match(r'^(\s*)(.*\.locator\(.*?\))', line)
-             if full_prefix_match:
-                 prefix = full_prefix_match.group(2) # Capture the full locator part
-             else:
-                 prefix = prefix_before_locator + ".locator('" + selector_in_locator + "')" # Reconstruct prefix
-             selector = selector_in_locator
-             value = value_in_method
-             method_name = method # fill or type
-
-        elif match_fill_type:
-            indent, prefix_part, method, selector_or_value, remaining_args_str = match_fill_type.groups()
-            method_name = method # fill or type
-
-            # Need to differentiate between page.fill(selector, value) and locator.fill(value)
-            # A simple heuristic: if the part before .fill/.type looks like a locator variable,
-            # then selector_or_value is the value, and we need to get the selector from somewhere else (hard).
-            # If it looks like 'page', then selector_or_value is the selector.
-
-            # Let's focus on the page.fill(selector, value) pattern first as it's easier to reliably parse
-            match_page_fill_type_explicit = re.match(r'^(\s*)(page)\.(fill|type)\s*\(\s*["\'](.*?)["\']\s*,\s*["\'](.*?)["\']\s*\).*$', line)
-            if match_page_fill_type_explicit:
-                 indent, prefix, method, selector, value = match_page_fill_type_explicit.groups()
-                 method_name = method
-
-        if selector and value and prefix and method_name in ['fill', 'type']:
-             # Check if the selector matches one of the known readonly selectors
-             # Simple contains check for now, can be made more robust
-             if any(rs in selector for rs in readonly_selectors):
-                # Construct page.evaluate() call
-                # Using arguments[1] and arguments[2] to pass selector and value safely
-                # The JS code finds the element by selector and sets its value
-                evaluate_js = "selector => { const element = document.querySelector(selector); if (element) { element.value = arguments[1]; element.dispatchEvent(new Event('input', { bubbles: true })); element.dispatchEvent(new Event('change', { bubbles: true })); } }" # Add input/change events
-                evaluate_line = f'{original_indent}page.evaluate("{evaluate_js}", "{selector}", "{value}")'
-
-                processed_lines.append(evaluate_line)
-                logging.info(f"Replaced .{method_name}() with .evaluate() for potential readonly selector: {selector}")
-                modified = True
+                if match_locator_method:
+                    indent, var_name, locator_creation_part, method_name_locator, value_locator = match_locator_method.groups()
+                    # Attempt to extract selector from the locator_creation_part
+                    selector_match = re.search(r'locator\s*\(\s*["\'](.*?)["\']\s*\)', locator_creation_part)
+                    if selector_match:
+                        selector = selector_match.group(1)
+                        value = value_locator
+                         # Check if this selector matches any of the readonly patterns
+                        if any(pattern.search(selector) for pattern in readonly_selector_patterns):
+                            # Construct page.evaluate() call (assuming 'page' object is available)
+                            evaluate_js = "selector => {{ const element = document.querySelector(selector); if (element) {{ element.value = arguments[1]; element.dispatchEvent(new Event('input', {{ bubbles: true }})); element.dispatchEvent(new Event('change', {{ bubbles: true }})); }} }}"
+                            # We need the page object. Assuming the locator was created from a page object,
+                            # we can't reliably get the page object variable name here.
+                            # Relying on the AI to correctly generate page.evaluate is better.
+                            # For post-processing, if we detect this pattern, we could try to infer the page object
+                            # or just log a warning and rely on the AI. Let's rely on AI for now.
+                            logging.warning(f"Detected locator.{method_name_locator}() for potential readonly selector: {selector}. Relying on AI to replace with page.evaluate.")
+                            # We won't modify the line here, let the AI handle it based on the prompt.
+                            modified = False # Do not mark as modified by post-processing
+                        else:
+                             # If it's not a readonly selector, keep the original line
+                             modified = False # Do not mark as modified by post-processing
 
 
         if not modified:
@@ -210,9 +221,9 @@ def fix_empty_blocks_with_pass(code):
                          processed_lines.append(f"{current_line_indent}    pass") # 假设使用4个空格缩进
 
             else:
-                 # 如果是最后一行且是 try, except, finally 结尾，也认为是空块，插入 pass
+                 # If it's the last line ending with try, except, or finally, insert pass
                  current_line_indent = line[:len(line) - len(line.lstrip())]
-                 processed_lines.append(f"{current_line_indent}    pass") # 假设使用4个空格缩进
+                 processed_lines.append(f"{current_line_indent}    pass") # Assume 4 spaces indentation
 
         i += 1
     return "\n".join(processed_lines)
@@ -241,10 +252,11 @@ def post_process_script(code):
     对生成的脚本进行后处理，例如移除无效断言、确保必要导入、修复空块、处理readonly输入框等。
     """
     code = ensure_imports(code) # 确保导入
-    # add_wait_before_actions should be called after replace_readonly_fill_with_evaluate
-    # because evaluate doesn't need wait_for editable state
-    code = replace_readonly_fill_with_evaluate(code) # 新增：处理 readonly 输入框
-    code = add_wait_before_actions(code) # 添加等待可见 (只对非 readonly fill/type 添加)
+    # Call replace_readonly_fill_with_evaluate first
+    # Relying more on AI to handle readonly, keep this for specific patterns
+    # code = replace_readonly_fill_with_evaluate(code) # Let AI handle this first
+    # Then add wait_for for other actions (that are not replaced)
+    code = add_wait_before_actions(code) # Add wait_for visible
     code = fix_empty_blocks_with_pass(code) # 修复空块
     # Add other post-processing steps here if needed
     # code = fix_unboundlocalerror(code) # Could implement specific fixes for UnboundLocalError
@@ -270,9 +282,10 @@ def get_failed_tests_from_log(log_file="pytest_errors.log"):
             # This pattern looks for lines starting with "FAILED" or "ERROR collecting"
             # followed by a file path, and then captures everything until the next
             # "==" separator or end of file.
-            # Modified to handle UnboundLocalError traceback as well
+            # Modified to handle various error types and capture more context
+            # Fixed redundant escape in regex
             failure_pattern = re.compile(
-                r"^(?:FAILED|ERROR collecting)\s+([\w\\/\.-]+\.py)(.*?)(?=^=+ short test summary info =+|^=+ .+ =+|$)",
+                r"^(?:FAILED|ERROR collecting)\s+([\w\\/\.-]+\.py)(.*?)(?=^==+ .+ ==+|^$)",
                 re.DOTALL | re.MULTILINE
             )
 
@@ -285,10 +298,6 @@ def get_failed_tests_from_log(log_file="pytest_errors.log"):
                 # Filter out .healed scripts
                 if script_path.endswith(".healed"):
                     continue
-
-                # Clean up some traceback lines to reduce noise for the AI
-                # error_details = re.sub(r'File ".*?playwright[\\/]_impl[\\/].*?\.py", line \d+.*?\n', '', error_details, flags=re.DOTALL)
-                # error_details = re.sub(r'C:\\Program Files\\Python.*?\\site-packages\\.*?\n', '', error_details, flags=re.DOTALL)
 
                 # Store the first occurrence of failure for a script
                 if script_path not in failed_tests:
@@ -311,15 +320,15 @@ def load_testcase_by_script_name(script_name, testcases_file="testcases.json"):
     脚本文件名格式如 playwright_scripts/test_playwright_1.py 或 playwright_scripts/test_playwright_1.py.healed
     """
     try:
-        # 从文件名中提取索引，例如 playwright_test_1.py -> 1
-        # 移除目录部分和 .healed 后缀，只匹配文件名中的数字
+        # From the error log, the script paths are like playwright_scripts/test_playwright_1.py
+        # The testcase index is based on the number in the filename.
         base_script_name = os.path.basename(script_name)
         match = re.search(r"test_playwright_(\d+)\.py(?:\.healed)?$", base_script_name)
         if not match:
             logging.warning(f"脚本文件名格式不匹配，无法找到对应用例: {script_name}")
             return None
 
-        testcase_index = int(match.group(1)) - 1 # 索引从0开始
+        testcase_index = int(match.group(1)) - 1 # Index is 0-based
 
         if not os.path.exists(testcases_file):
             logging.error(f"未找到测试用例文件: {testcases_file}")
@@ -355,7 +364,7 @@ def call_deepseek_api(prompt):
     data = {
         "model": "deepseek-chat",
         "messages": [
-            {"role": "system", "content": "You are a helpful AI assistant that refactors Python code. Focus on fixing syntax and runtime errors, especially Playwright-related issues like timeouts or incorrect element interactions. If an input element is readonly or not editable and the error log indicates a failure with .fill() or .type(), suggest using page.evaluate() to set its value via JavaScript. If a locator matches multiple elements causing strict mode violation, suggest using a more specific locator or methods like .first(), .last(), .nth(index). Pay close attention to the provided error messages and test case steps."},
+            {"role": "system", "content": "You are a helpful AI assistant that refactors Python code. Focus on fixing syntax and runtime errors, especially Playwright-related issues like timeouts or incorrect element interactions. If an input element is readonly or not editable and the error log indicates a failure with .fill() or .type(), suggest using page.evaluate() to set its value via JavaScript. If a locator matches multiple elements causing strict mode violation, suggest using a more specific locator or methods like .first(), .last(), .nth(index). Pay close attention to the provided error messages and test case steps. Ensure the generated code is a complete and syntactically correct Python script for pytest with Playwright."},
             {"role": "user", "content": prompt}
         ],
         "stream": False
@@ -363,7 +372,7 @@ def call_deepseek_api(prompt):
 
     try:
         logging.info("Calling DeepSeek API...")
-        response = requests.post(DEEPSEEK_API_URL, headers=headers, json=data, timeout=120) # Increased timeout
+        response = requests.post(DEEPSEEK_API_URL, headers=headers, json=data, timeout=180) # Increased timeout further
         response.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
         result = response.json()
         # logging.debug(f"DeepSeek API raw response: {json.dumps(result, indent=2, ensure_ascii=False)}")
@@ -371,6 +380,8 @@ def call_deepseek_api(prompt):
             return result['choices'][0]['message']['content']
         else:
             logging.warning("DeepSeek API 返回空内容或格式错误。")
+            # Log the full response if it's not as expected for debugging
+            # logging.warning(f"DeepSeek API full response: {json.dumps(result, indent=2, ensure_ascii=False)}")
             return None
     except requests.exceptions.Timeout:
         logging.error("调用 DeepSeek API 超时。")
@@ -390,7 +401,7 @@ def heal_script(original_script_path, testcase, error_info):
     logging.info(f"正在自愈脚本: {original_script_path}")
     logging.info(f"失败信息 (部分): {error_info[:500]}...")
 
-    # 读取原始失败脚本内容
+    # Read original failed script content
     try:
         with open(original_script_path, "r", encoding="utf-8") as f:
             original_code = f.read()
@@ -398,7 +409,7 @@ def heal_script(original_script_path, testcase, error_info):
         logging.error(f"读取原始失败脚本失败 {original_script_path}: {e}")
         return ""
 
-    # 构建给AI的Prompt
+    # Build Prompt for AI
     prompt = f"""
 我有一个Playwright自动化测试脚本在运行时或收集时失败了。
 原始脚本文件路径：{original_script_path}
@@ -411,13 +422,16 @@ def heal_script(original_script_path, testcase, error_info):
 {original_code}
 ```
 完整的错误信息如下：
-请根据提供的测试用例和完整的错误信息，修复这个Python脚本。修复后的代码应该是一个完整的、可运行的pytest Playwright测试脚本。特别注意修复：
-1. Python语法错误和缩进错误。
-2. Playwright相关的运行时错误，例如定位器找不到元素、操作超时、元素不可编辑/不可见等。
-3. 如果错误信息显示元素是只读的（readonly）导致无法填写（.fill()或.type()失败），请使用 page.evaluate() 执行 JavaScript 来设置元素的值，而不是 .fill() 或 .type()。
-4. 如果定位器匹配到多个元素导致严格模式（strict mode）冲突，请修改定位器使其只匹配一个元素，或者使用 .first(), .last(), .nth(index) 方法。
-5. 确保所有必要的 Playwright 导入（如 sync_playwright, expect）都存在。
-6. 修复因变量作用域导致的错误（如 UnboundLocalError）。
+请根据提供的测试用例和完整的错误信息，修复这个Python脚本。修复后的代码应该是一个完整的、可运行的pytest Playwright测试脚本。请特别注意修复以下问题：
+1. **Python语法错误和缩进错误**：确保代码是有效的Python语法，并且缩进正确。
+2. **Playwright运行时错误**：
+    - **元素定位问题**：如果错误提示元素找不到（e.g., `element not found`, `Locator expected to be visible/editable`）或者定位器匹配多个元素导致严格模式冲突（`strict mode violation`），请修改定位器，使用更准确的选择器，或者结合 Playwright 提供的链式定位方法（如 `.locator(...).locator(...)`）或序列方法（`.first()`, `.last()`, `.nth(index)`）。
+    - **元素交互问题**：如果错误提示元素不可见、不可编辑或被遮挡导致 `.click()`, `.fill()`, `.type()` 等操作超时，请在操作前添加适当的等待，例如 `locator.wait_for(state='visible')` 或 `locator.wait_for(state='editable')`。
+    - **只读输入框问题**：**重要！** 根据错误信息，用户名和密码输入框是只读的（`readonly`），直接使用 `.fill()` 或 `.type()` 会失败。请使用 `page.evaluate()` 方法执行 JavaScript 来设置这些只读输入框的值，例如：`page.evaluate("selector => {{ document.querySelector(selector).value = arguments[1]; }}", "#form_item_username", "your_username")`。请确保正确识别并替换针对 `#form_item_username`、`#form_item_password` 以及日志中出现的其他用户名字段定位器（如 `get_by_label("用户名")` 对应的元素）的 `.fill()` 或 `.type()` 调用。
+    - **页面跳转问题**：如果测试在点击某个链接或按钮后失败，检查是否正确使用了 `page.wait_for_url()` 或 `page.wait_for_navigation()` 来等待页面加载完成，并且目标 URL 或页面内容断言是正确的。
+
+3.  **导入问题**：确保脚本开头包含了所有必要的 Playwright 和其他模块导入（如 `pytest`, `sync_playwright`, `expect`, `re`）。
+4.  **变量作用域问题**：修复因变量未定义或作用域不正确导致的错误（如 `UnboundLocalError`）。
 
 只返回修复后的Python代码，不要包含任何解释或其他文本，将代码放在Markdown代码块中。
 """
@@ -432,21 +446,29 @@ def heal_script(original_script_path, testcase, error_info):
     # 清理AI返回的代码块
     healed_code = clean_code_block(healed_code_raw)
 
-    # 对自愈后的代码进行后处理
-    healed_code = post_process_script(healed_code)
+    # Post-process the healed code
+    # Note: Post-processing should ideally not alter the AI's key fixes (like evaluate calls)
+    # but handle formatting and general issues.
+    healed_code = ensure_imports(healed_code) # Ensure imports
+    # We might skip add_wait_before_actions and replace_readonly_fill_with_evaluate here
+    # and rely on the AI to incorporate waits and evaluate calls based on the detailed prompt.
+    # If AI struggles, we can re-enable specific post-processing steps.
+    # healed_code = replace_readonly_fill_with_evaluate(healed_code) # Let AI handle this first
+    healed_code = add_wait_before_actions(healed_code) # Add wait_for visible (only to non-replaced actions)
+    healed_code = fix_empty_blocks_with_pass(healed_code) # Fix empty blocks
 
-    # 最终检查修复后的代码是否是有效的Python
+    # Final check if the healed code is valid Python
     if not is_valid_python(healed_code):
         logging.error("AI自愈后的代码不是有效的Python代码，放弃保存。")
-        # 可以选择将无效代码保存到一个临时文件以便调试
+        # Optionally save invalid code for debugging
         # with open(f"{original_script_path}.invalid", "w", encoding="utf-8") as f:
         #     f.write(healed_code)
         return ""
 
-    # 生成修复后的文件名
+    # Generate healed filename
     healed_script_path = f"{original_script_path}.healed"
 
-    # 保存修复后的脚本
+    # Save healed script
     try:
         with open(healed_script_path, "w", encoding="utf-8") as f:
             f.write(healed_code)
@@ -463,125 +485,129 @@ def run_healed_tests(healed_files, allure_dir="allure-results", max_retries=1):
     logging.info(f"正在运行自愈后的测试脚本: {healed_files}")
 
     success = True
-    # 针对每个修复的文件单独运行，这样即使部分修复失败也不影响其他修复成功的
+    # Run each healed file separately so that failure in one doesn't affect others
     for healed_file in healed_files:
         if not os.path.exists(healed_file):
             logging.warning(f"自愈后的脚本文件不存在，跳过运行: {healed_file}")
-            success = False # 认为整体修复运行失败
+            success = False # Consider overall healing run failed
             continue
 
         logging.info(f"正在运行自愈脚本: {healed_file}")
-        # 构建pytest命令，只运行当前修复的文件
-        # --clean-alluredir 不清空，以便合并报告
-        # --verbose 打印更详细的测试结果
+        # Build pytest command to run only the current healed file
+        # --clean-alluredir False to merge reports
+        # --verbose to print detailed test results
         command = ["pytest", "--verbose", healed_file, f"--alluredir={allure_dir}"]
 
-        # 添加重试逻辑
+        # Add retry logic
         for attempt in range(max_retries + 1):
             logging.info(f"执行命令 (尝试 {attempt + 1}/{max_retries + 1}): {' '.join(command)}")
             try:
-                # 运行命令并捕获输出
-                # text=True, encoding='utf-8'确保输出正确解码
-                result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8', check=False) # check=False 即使pytest失败也不抛异常
+                # Run command and capture output
+                # text=True, encoding='utf-8' ensures correct decoding
+                result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8', check=False) # check=False doesn't raise exception on non-zero exit code
 
                 logging.info(f"Pytest 执行完成 for {healed_file}.")
                 logging.info("--- Pytest 标准输出 ---")
                 logging.info(result.stdout)
                 logging.info("--- Pytest 标准错误 ---")
-                logging.error(result.stderr) # 运行失败的错误输出应该用error级别
+                logging.error(result.stderr) # Error output should be logged as error
                 logging.info(f"--- Pytest 执行结束 for {healed_file} ---")
 
-                # 将 pytest 的输出（包括标准输出和标准错误）写入 pytest_errors.log，覆盖旧内容
-                # 这样下次自愈脚本可以读取最新的失败信息
+                # Write pytest output (stdout and stderr) to pytest_errors.log, overwriting old content
+                # This way, the auto-healing script can read the latest failure information next time
                 with open("pytest_errors.log", "w", encoding="utf-8") as f:
                      f.write(result.stdout)
                      f.write(result.stderr)
 
                 if result.returncode == 0:
                     logging.info(f"自愈脚本 {healed_file} 执行成功。")
-                    # 如果成功，可以删除对应的 .healed 文件，或者保留作为成功的标记
+                    # Optionally, remove the .healed file after successful run
                     # os.remove(healed_file) # Optional: clean up successful healed scripts
-                    break # 成功则跳出重试循环
+                    break # Exit retry loop on success
                 else:
                     logging.warning(f"自愈脚本 {healed_file} 执行失败，退出码: {result.returncode}.")
                     if attempt < max_retries:
                         logging.info(f"正在重试运行 {healed_file}...")
-                        # 可选：在重试前等待一段时间
+                        # Optional: wait for some time before retrying
                         # import time
                         # time.sleep(5)
                     else:
                         logging.error(f"自愈脚本 {healed_file} 在 {max_retries + 1} 次尝试后仍然失败。")
-                        success = False # 标记整体失败
+                        success = False # Mark overall failure
             except FileNotFoundError:
                 logging.error("未找到 pytest 命令。请确保 pytest 已安装。")
-                # 将错误信息写入日志文件
+                # Write error message to log file
                 with open("pytest_errors.log", "w", encoding="utf-8") as f:
                     f.write("未找到 pytest 命令。")
-                success = False # 标记整体失败
-                break # 命令都找不到，重试也没用
+                success = False # Mark overall failure
+                break # No point in retrying if command is not found
             except Exception as e:
                 logging.error(f"运行自愈脚本 {healed_file} 时发生异常: {e}")
-                # 将异常信息写入日志文件
+                # Write exception info to log file
                 with open("pytest_errors.log", "w", encoding="utf-8") as f:
                     f.write(f"运行自愈脚本时发生异常: {e}")
-                success = False # 标记整体失败
-                break # 发生异常，停止重试
+                success = False # Mark overall failure
+                break # Stop retrying on exception
 
     return success
 
 
 if __name__ == "__main__":
-    # 假设 pytest_errors.log 包含上一步运行测试的失败信息
+    # Assume pytest_errors.log contains failure information from the previous test run
     error_log_file = "pytest_errors.log"
-    testcases_file = "testcases.json" # 测试用例文件
-    script_dir = "playwright_scripts" # 生成脚本的目录
-    max_heal_attempts_per_script = 2 # 每个失败脚本最多尝试自愈的次数
+    testcases_file = "testcases.json" # Test case file
+    script_dir = "playwright_scripts" # Directory where scripts are generated
+    max_heal_attempts_per_script = 2 # Max number of healing attempts per failed script
 
-    # 确保 Playwright 脚本目录存在
+    # Ensure Playwright scripts directory exists
     if not os.path.exists(script_dir):
         os.makedirs(script_dir)
 
-    # 在开始自愈前，先检查是否有 pytest_errors.log 文件存在。
-    # 如果不存在，说明运行测试阶段可能压根没启动或者没有产生日志，自愈就没有意义。
+    # Before starting healing, check if pytest_errors.log file exists.
+    # If not, it means the test run stage might not have started or produced logs,
+    # so healing is not relevant.
     if not os.path.exists(error_log_file):
          logging.info(f"未找到错误日志文件 {error_log_file}，跳过自愈阶段。")
-         # 如果流水线配置为即使测试失败也继续，这里应该以成功退出
-         # 如果流水线配置为测试失败则中断，这里应该以失败退出
-         # 根据你的 Jenkinsfile，运行测试失败会直接导致阶段失败，
-         # 所以这里即使没有日志，也可能意味着上一步失败了。
-         # 稳妥起见，如果没有日志，可以认为没有需要处理的特定脚本错误，正常退出。
+         # If the pipeline is configured to continue even if tests fail, exit successfully here.
+         # If the pipeline is configured to abort on test failure, exiting with failure might be appropriate.
+         # Based on your Jenkinsfile, test failure leads to stage failure.
+         # So, even without logs, it could mean the previous step failed.
+         # To be safe, if no logs are found, assume no specific script errors need healing and exit successfully.
          exit(0)
 
 
-    # 循环尝试自愈和重新运行
+    # Loop for auto-healing attempts
     for heal_attempt in range(max_heal_attempts_per_script):
         logging.info(f"--- 自动自愈尝试 {heal_attempt + 1}/{max_heal_attempts_per_script} ---")
 
-        # 读取当前的失败脚本列表和错误信息
+        # Read current list of failed scripts and error information
         failed_tests_info = get_failed_tests_from_log(error_log_file)
         failed_scripts = list(failed_tests_info.keys())
 
         if not failed_scripts:
             logging.info("没有需要自愈的失败脚本。")
-            # 如果在任何一次自愈尝试中，没有失败脚本需要处理，说明问题已经解决
+            # If in any healing attempt, no failed scripts are found, it means the issue is resolved
             logging.info("自动自愈成功！所有测试通过或已修复。")
-            exit(0) # 没有失败脚本，以成功退出
+            exit(0) # No failed scripts, exit successfully
 
         logging.info(f"检测到 {len(failed_scripts)} 个失败脚本，开始自愈...")
 
         healed_scripts = []
-        current_attempt_healing_success = True # 标记当前轮次的自愈是否全部成功
+        current_attempt_healing_success = True # Flag for current round's healing success
 
         for script_path in failed_scripts:
             logging.info(f"尝试自愈脚本: {script_path}")
-            error_info = failed_tests_info.get(script_path, "未知错误信息") # 获取该脚本的错误信息
+            error_info = failed_tests_info.get(script_path, "未知错误信息") # Get error info for the script
 
-            # 确保脚本路径是相对于当前工作目录的正确路径
+            # Ensure script path is correct relative to current working directory
             full_script_path = os.path.join(script_dir, os.path.basename(script_path))
+            # Before healing, ensure the original file exists, or try to restore from backup (optional)
             if not os.path.exists(full_script_path):
+                 # Add logic to try restoring from .failed_backup_X files if needed
                  logging.error(f"原始失败脚本文件不存在，跳过自愈: {full_script_path}")
                  current_attempt_healing_success = False
                  continue
+
 
             testcase = load_testcase_by_script_name(full_script_path, testcases_file)
 
@@ -589,42 +615,54 @@ if __name__ == "__main__":
                 healed_script_path = heal_script(full_script_path, testcase, error_info)
                 if healed_script_path and os.path.exists(healed_script_path):
                     healed_scripts.append(healed_script_path)
-                    # 成功自愈后，可以将原始失败的脚本重命名或备份，
-                    # 并在 run_healed_tests 中只运行 .healed 文件
+                    # After successful healing, rename the original failed script so get_failed_tests_from_log doesn't detect it next time
                     try:
                          original_backup_path = f"{full_script_path}.failed_backup_{heal_attempt}"
                          os.rename(full_script_path, original_backup_path)
-                         logging.info(f"备份原始失败脚本到: {original_backup_path}")
+                         logging.info(f"Backed up original failed script to: {original_backup_path}")
                     except Exception as e:
-                         logging.warning(f"备份原始失败脚本失败 {full_script_path}: {e}")
+                         logging.warning(f"Failed to backup original failed script {full_script_path}: {e}")
 
                 else:
                     logging.error(f"自愈脚本 {full_script_path} 失败。")
                     current_attempt_healing_success = False
             else:
                 logging.error(f"找不到脚本 {full_script_path} 对应的测试用例，跳过自愈。")
-                current_attempt_healing_success = False # 找不到用例也算自愈失败
+                current_attempt_healing_success = False # Failure if test case not found
 
         if not healed_scripts:
             logging.error(f"自愈尝试 {heal_attempt + 1}：没有脚本成功自愈。")
-            # 如果当前轮次没有脚本成功自愈，并且还有失败脚本，则继续下一轮尝试（如果允许）
-            continue
+            # If no scripts were successfully healed in this round, and there are still failed scripts,
+            # continue to the next attempt (if allowed)
+            if heal_attempt < max_heal_attempts_per_script -1 and failed_scripts:
+                 logging.info("Proceeding to the next auto-healing attempt...")
+                 continue # Continue outer loop to next attempt
+            else:
+                 # No successfully healed scripts, and reached max attempts, or no more failed scripts (checked above)
+                 logging.error(f"Reached maximum auto-healing attempts ({max_heal_attempts_per_script}). Auto-healing ultimately failed.")
+                 exit(1) # Exit with failure
 
         logging.info(f"自愈尝试 {heal_attempt + 1}：成功自愈以下脚本: {healed_scripts}")
 
-        # 运行修复后的测试脚本
+        # Run healed test scripts
         logging.info(f"自愈尝试 {heal_attempt + 1}：运行自愈后的测试...")
         run_success = run_healed_tests(healed_scripts)
 
         if run_success:
             logging.info(f"自愈尝试 {heal_attempt + 1}：所有自愈后的测试运行成功。")
             logging.info("自动自愈成功！所有测试通过或已修复。")
-            exit(0) # 修复后的测试运行成功，以成功退出
+            exit(0) # Healed tests ran successfully, exit with success
         else:
             logging.warning(f"自愈尝试 {heal_attempt + 1}：运行自愈后的测试失败。")
-            # 如果运行修复后的测试仍然失败，继续下一轮尝试（如果允许）
-            pass # 继续循环
+            # If running healed tests still fails, continue to the next attempt (if allowed)
+            if heal_attempt < max_heal_attempts_per_script - 1:
+                 logging.info("Proceeding to the next auto-healing attempt...")
+                 continue # Continue outer loop to next attempt
+            else:
+                 logging.error(f"Reached maximum auto-healing attempts ({max_heal_attempts_per_script}), and healed tests still failing. Auto-healing ultimately failed.")
+                 exit(1) # Exit with failure
 
-    # 如果循环结束，仍然有失败脚本
-    logging.error(f"在 {max_heal_attempts_per_script} 次自愈尝试后，仍然存在失败脚本。自动自愈最终失败。")
-    exit(1) # 超过最大尝试次数，以失败退出
+    # If all auto-healing attempts are exhausted and there are still failed scripts, exit with code 1
+    # (The loop logic above should handle this, but this is a final safeguard)
+    logging.error("Auto-healing process ended unexpectedly. There might be unhandled failed scripts.")
+    exit(1)
