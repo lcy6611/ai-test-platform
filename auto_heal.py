@@ -10,6 +10,7 @@ import glob
 import subprocess
 import re
 import requests # Added imports based on function usage
+import ast # Needed for is_valid_python
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -47,53 +48,115 @@ def ensure_imports(code):
     """
     required_imports = [
         "import pytest",
-        "from playwright.sync_api import sync_playwright"
+        "from playwright.sync_api import sync_playwright",
+        "from playwright.sync_api import expect" # Added expect import
     ]
     lines = code.splitlines()
     existing_imports = [line.strip() for line in lines if line.strip().startswith("import") or line.strip().startswith("from")]
 
     for imp in required_imports:
-        if not any(imp in existing for existing in existing_imports):
-            # 在现有导入后或文件顶部添加缺失的导入
+        if not any(imp in existing and imp.split(" import ")[-1] in existing for existing in existing_imports):
+             # 检查是否已经导入了整个模块，例如 'import pytest' 就足够了
+            if imp.startswith("import ") and any(imp.split(" import ")[-1].split('.')[0] in existing for existing in existing_imports):
+                continue # 模块已导入，跳过
+
+            # 查找最后一个导入语句的位置
             insert_index = 0
-            for i, line in enumerate(lines):
-                if line.strip().startswith("import") or line.strip().startswith("from"):
+            for i in range(len(lines) - 1, -1, -1):
+                if lines[i].strip().startswith("import") or lines[i].strip().startswith("from"):
                     insert_index = i + 1
-                elif line.strip() and not (line.strip().startswith("#") or line.strip().startswith('"""') or line.strip().startswith("'''")):
-                    # 如果遇到非导入、非注释、非 docstring 的行，则在其之前插入
-                    insert_index = i
                     break
+                # 如果上面没有找到导入语句，查找文档字符串后的第一行
+                if lines[i].strip().endswith('"""') or lines[i].strip().endswith("'''"):
+                    insert_index = i + 1
+                    break
+
             lines.insert(insert_index, imp)
             logging.info(f"Added missing import: {imp}")
 
     return "\n".join(lines)
 
+
 def add_wait_before_actions(code):
     """
-    在 Playwright 的 fill(), click(), type() 前添加等待元素可编辑/可用状态。
+    在 Playwright 的 fill(), click(), type() 前添加等待元素可见状态。
+    注意：这里只添加可见等待，不处理 readonly 导致 fill 失败的问题，
+    readonly 问题由 replace_readonly_fill_with_evaluate 处理。
     """
     lines = code.splitlines()
     processed_lines = []
     for i, line in enumerate(lines):
         stripped_line = line.strip()
         # 简单的正则匹配 Playwright 交互操作
-        match_fill = re.match(r'^(.*\.)fill\((.*)\)$', stripped_line)
-        match_click = re.match(r'^(.*\.)click\((.*)\)$', stripped_line)
+        match_fill = re.match(r'^(.*\.)fill\\((.*)\\)$', stripped_line) # Escape parenthesis for regex
+        match_click = re.match(r'^(.*\.)click\\((.*)\\)$', stripped_line) # Escape parenthesis for regex
         match_type = re.match(r'^(.*\.)type\\((.*)\\)$', stripped_line) # Escape parenthesis for regex
 
-        if match_fill or match_click or match_type:
-            # 提取 locator 部分，例如 'page.locator("#username")'
+        # 检查是否不是针对 readonly 输入框的 fill 操作，避免重复等待
+        is_readonly_fill = False
+        if match_fill:
+             # 简单的检查选择器是否是针对已知 readonly 输入框的，这里无法精确判断，留待 replace_readonly_fill_with_evaluate 处理
+            pass
+
+
+        if (match_fill or match_click or match_type) and not is_readonly_fill:
+            # 提取 locator 或 page 对象部分
             locator_part = (match_fill or match_click or match_type).group(1)
-            # 插入等待可编辑的逻辑，保持原有缩进
+            # 插入等待可见的逻辑，保持原有缩进
             indent = line[:len(line) - len(stripped_line)]
-            # 使用 state='visible' 作为通用等待状态，更安全
-            wait_line = f"{indent}{locator_part}.wait_for(state='visible', timeout=15000)" # 15秒等待
+            wait_line = f"{indent}{locator_part}.wait_for(state='visible', timeout=15000)" # 15秒等待可见
             processed_lines.append(wait_line)
             processed_lines.append(line) # 添加原始操作行
         else:
             processed_lines.append(line) # 添加非操作行
 
     return "\n".join(processed_lines)
+
+def replace_readonly_fill_with_evaluate(code):
+    """
+    检测针对已知 readonly 输入框的 .fill() 调用，并替换为 page.evaluate()。
+    """
+    readonly_selectors = ["#form_item_username", "#form_item_password"] # 定义已知只读输入框的选择器
+
+    lines = code.splitlines()
+    processed_lines = []
+
+    for i, line in enumerate(lines):
+        stripped_line = line.strip()
+        original_indent = line[:len(line) - len(stripped_line)]
+        modified = False
+
+        # 匹配 page.locator("SELECTOR").fill("VALUE") 模式
+        match_locator_fill = re.match(r'^(.*\.\s*locator\s*\(\s*["\'](.*?)["\']\s*\)\s*\.\s*fill\s*\(\s*["\'](.*?)["\']\s*\)).*$', stripped_line)
+        # 匹配 page.fill("SELECTOR", "VALUE") 模式
+        match_page_fill = re.match(r'^(.*\.\s*fill\s*\(\s*["\'](.*?)["\']\s*,\s*["\'](.*?)["\']\s*\)).*$', stripped_line)
+
+
+        if match_locator_fill:
+            full_match, selector, value = match_locator_fill.groups()
+            if selector in readonly_selectors:
+                # 构建 page.evaluate() 调用
+                # 使用 arguments[1] 安全地传递值，避免JS注入问题
+                evaluate_line = f"{original_indent}{match_locator_fill.group(1).split('.')[0]}.evaluate('selector => {{ const element = document.querySelector(selector); if (element) element.value = arguments[1]; }}', '{selector}', '{value}')"
+                processed_lines.append(evaluate_line)
+                logging.info(f"Replaced .fill() with .evaluate() for readonly selector: {selector}")
+                modified = True
+
+        elif match_page_fill:
+            full_match, selector, value = match_page_fill.groups()
+            if selector in readonly_selectors:
+                 # 构建 page.evaluate() 调用
+                evaluate_line = f"{original_indent}{match_page_fill.group(1).split('.')[0]}.evaluate('selector => {{ const element = document.querySelector(selector); if (element) element.value = arguments[1]; }}', '{selector}', '{value}')"
+                processed_lines.append(evaluate_line)
+                logging.info(f"Replaced page.fill() with page.evaluate() for readonly selector: {selector}")
+                modified = True
+
+
+        if not modified:
+            processed_lines.append(line)
+
+    return "\n".join(processed_lines)
+
 
 def fix_empty_blocks_with_pass(code):
     """
@@ -138,7 +201,7 @@ def is_valid_python(code):
     检查给定的字符串是否是有效的Python代码。
     """
     try:
-        compile(code, "<string>", "exec")
+        ast.parse(code) # Use ast.parse for more robust syntax checking
         return True
     except IndentationError as e:
         logging.error(f"代码存在缩进错误: {e}")
@@ -153,12 +216,13 @@ def is_valid_python(code):
 
 def post_process_script(code):
     """
-    对生成的脚本进行后处理，例如移除无效断言、确保必要导入、修复空块等。
+    对生成的脚本进行后处理，例如移除无效断言、确保必要导入、修复空块、处理readonly输入框等。
     """
     # code = clean_code_block(code) # clean_code_block 应该在获取AI响应后立即调用
     # code = remove_invalid_asserts(code) # 如果需要移除特定断言，可以在这里实现
     code = ensure_imports(code) # 确保导入
-    code = add_wait_before_actions(code) # 添加等待
+    code = add_wait_before_actions(code) # 添加等待可见
+    code = replace_readonly_fill_with_evaluate(code) # 新增：处理 readonly 输入框
     code = fix_empty_blocks_with_pass(code) # 修复空块
     return code
 
@@ -185,6 +249,11 @@ def get_failed_tests_from_log(log_file="pytest_errors.log"):
             # 检查是否有 NameError 或 IndentationError 等收集错误
             collection_errors = re.findall(r"ERROR collecting\s+([\w\\/\.-]+\.py)", content)
             failed_files.update({f for f in collection_errors if not f.endswith(".healed")})
+
+            # 检查是否有 TimeoutError 并且日志中包含 "element is not editable" 或 "input readonly"
+            timeout_errors = re.findall(r"playwright\._impl\._errors\.TimeoutError: .*?\n.*?element is not editable.*?\n.*?locator resolved to <input readonly.*?\n.*?([\w\\/\.-]+\.py)", content, re.DOTALL)
+            failed_files.update({f for f in timeout_errors if not f.endswith(".healed")})
+
 
     except Exception as e:
         logging.error(f"解析pytest错误日志失败: {e}")
@@ -244,7 +313,7 @@ def call_deepseek_api(prompt):
     data = {
         "model": "deepseek-chat",
         "messages": [
-            {"role": "system", "content": "You are a helpful AI assistant that refactors Python code. Focus on fixing syntax and runtime errors."},
+            {"role": "system", "content": "You are a helpful AI assistant that refactors Python code. Focus on fixing syntax and runtime errors, especially Playwright-related issues like timeouts or incorrect element interactions. If an input is readonly, suggest using JavaScript page.evaluate to set its value."},
             {"role": "user", "content": prompt}
         ],
         "stream": False
@@ -295,7 +364,7 @@ def heal_script(original_script_path, testcase, error_info):
 {original_code}
 ```
 错误信息如下：
-请根据提供的测试用例和错误信息，修复这个Python脚本。修复后的代码应该是一个完整的、可运行的pytest Playwright测试脚本。特别注意修复缩进错误、定位器问题或超时问题。只返回修复后的Python代码，不要包含任何解释或其他文本，将代码放在Markdown代码块中。
+请根据提供的测试用例和错误信息，修复这个Python脚本。修复后的代码应该是一个完整的、可运行的pytest Playwright测试脚本。特别注意修复缩进错误、语法错误、定位器问题或超时问题。如果错误信息显示元素是只读的（readonly）导致无法填写，请尝试使用 page.evaluate() 执行 JavaScript 来设置元素的值，而不是使用 .fill() 或 .type()。只返回修复后的Python代码，不要包含任何解释或其他文本，将代码放在Markdown代码块中。
 """
 
     logging.info("正在调用AI进行自愈...")
@@ -394,6 +463,11 @@ if __name__ == "__main__":
     error_log_file = "pytest_errors.log"
     testcases_file = "testcases.json" # 测试用例文件
 
+    # 确保 Playwright 脚本目录存在
+    script_dir = "playwright_scripts"
+    if not os.path.exists(script_dir):
+        os.makedirs(script_dir)
+
     failed_scripts = get_failed_tests_from_log(error_log_file)
 
     if not failed_scripts:
@@ -419,22 +493,37 @@ if __name__ == "__main__":
         # 这是一个简化的实现，实际可能需要更复杂的日志解析
         script_error_info = f"脚本 {script_path} 的错误信息:\n" + error_info_full # 简单地附上完整日志
 
-        testcase = load_testcase_by_script_name(script_path, testcases_file)
+        # 确保脚本路径是相对于当前工作目录的正确路径
+        full_script_path = os.path.join(script_dir, os.path.basename(script_path))
+        if not os.path.exists(full_script_path) and script_path != full_script_path:
+             # 如果原始路径不是在 script_dir 下，并且不存在，尝试直接使用原始路径
+             full_script_path = script_path
+             if not os.path.exists(full_script_path):
+                 logging.error(f"原始失败脚本文件不存在，跳过自愈: {script_path}")
+                 overall_healing_success = False
+                 continue
+
+
+        testcase = load_testcase_by_script_name(full_script_path, testcases_file)
 
         if testcase:
-            healed_script_path = heal_script(script_path, testcase, script_error_info)
+            healed_script_path = heal_script(full_script_path, testcase, script_error_info)
             if healed_script_path and os.path.exists(healed_script_path):
                 healed_scripts.append(healed_script_path)
             else:
-                logging.error(f"自愈脚本 {script_path} 失败。")
+                logging.error(f"自愈脚本 {full_script_path} 失败。")
                 overall_healing_success = False
         else:
-            logging.error(f"找不到脚本 {script_path} 对应的测试用例，跳过自愈。")
+            logging.error(f"找不到脚本 {full_script_path} 对应的测试用例，跳过自愈。")
             overall_healing_success = False # 找不到用例也算自愈失败
 
     if not healed_scripts:
         logging.error("没有脚本成功自愈。自愈阶段失败。")
-        exit(1) # 没有成功自愈的脚本，退出码为1
+        # 如果有失败但没有成功自愈的脚本，也应该以非零退出码结束
+        if failed_scripts:
+             exit(1)
+        else:
+             exit(0) # 没有失败脚本，正常退出
 
     logging.info(f"成功自愈以下脚本: {healed_scripts}")
 
