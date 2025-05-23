@@ -10,7 +10,7 @@ import logging
 # 设置日志
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-def run_pytest_tests(test_pattern="playwright_test_*.py", allure_dir="allure-results"):
+def run_pytest_tests(test_pattern="playwright_scripts/test_playwright_*.py", allure_dir="allure-results"):
     """
     使用pytest运行指定模式的测试文件，并生成Allure报告。
     """
