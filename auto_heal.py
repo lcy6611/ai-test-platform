@@ -16,7 +16,7 @@ import ast # Needed for is_valid_python
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 # 假设失败信息会写入 pytest_errors.log (由 run_tests.py 生成)
-# 假设AI生成的修复脚本以 .healed 结尾
+# 假设AI生成的修复脚本以 .healed 结尾11111111
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
